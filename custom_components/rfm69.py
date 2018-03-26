@@ -138,12 +138,14 @@ class Rfm69hcw(object):
         if self._rfm69.DATALEN > 0 and id_sender in self._responses:
             message = list(self._rfm69.DATA)
             self._responses[id_sender].put(message)
-        _LOGGER.warning("Rfm69: Received message %s from node %d" % (str(message), id_sender))
+            _LOGGER.warning("Rfm69: Received message %s from node %d" % (str(message), id_sender))
+        else:
+            _LOGGER.warning("Rfm69: Discarded message of length %d from node %d" % (self._rfm69.DATALEN, id_sender))
 
-        if self._rfm69.ACK_REQUESTED:
-            self._rfm69.sendACK(id_sender)
+        # if self._rfm69.ACK_REQUESTED:
+        #     self._rfm69.sendACK(id_sender)
         # TODO: Changed from receiveBegin?
-        self._rfm69.receiveDone()
+        # self._rfm69.receiveDone()
 
 
     def receive_message(self, node_id, time_wait_sec=1.0, message_to_cache=None):
@@ -156,23 +158,22 @@ class Rfm69hcw(object):
         if response[0] is None:
             _LOGGER.warning("Rfm69: Unable to receive message from node %d" % node_id)
         elif message_to_cache is not None:
-            self._cache[message_to_cache] = (time.time(), response[0])
+            self._cache[message_to_cache] = (response[0], time.time())
 
-        return response
+        return response[0]
 
     def send_message(self, node_id, message, time_wait_sec=1.0, cache=False):
         # Send message
         # _LOGGER.warning("Rfm69: Sending message \"%s\" to node %d" % (message, node_id))
         # with self._lock:
-        if cache and message in self._cache and time.time() - self._cache[message][0] < self.CACHE_EXPIRE_SEC:
-            return self._cache[message][1]
+        if cache and message in self._cache and time.time() - self._cache[message][1] < self.CACHE_EXPIRE_SEC:
+            return self._cache[message][0]
 
         try:
             for _ in range(3):
                 self._rfm69.send(node_id, message, True)
-                reply = self.receive_message(node_id, time_wait_sec, message_to_cache=message)
-                if reply:
-                    return reply
+                # TODO: Better way to cache
+                return self.receive_message(node_id, time_wait_sec, message_to_cache="G.")
         except RuntimeError as err:
             _LOGGER.warning(err)
             sent = False
@@ -320,6 +321,7 @@ class RFM69(object):
         if newMode == self.mode:
             return
 
+        _LOGGER.warning("setMode {0}".format(newMode))
         if newMode == RF69_MODE_TX:
             self.writeReg(REG_OPMODE, (self.readReg(REG_OPMODE) & 0xE3) | RF_OPMODE_TRANSMITTER)
             if self.isRFM69HW:
@@ -367,7 +369,7 @@ class RFM69(object):
         #     self.receiveBegin()
         #     return True
         #if signal stronger than -100dBm is detected assume channel activity
-        elif self.mode == RF69_MODE_RX and self.PAYLOADLEN == 0 and self.readRSSI() < CSMA_LIMIT:
+        if self.mode == RF69_MODE_RX and self.PAYLOADLEN == 0 and self.readRSSI() < CSMA_LIMIT:
             self.setMode(RF69_MODE_STANDBY)
             return True
         return False
@@ -453,19 +455,22 @@ class RFM69(object):
         self.DATASENT = False
         self.setMode(RF69_MODE_TX)
         txStart = time.time()
+        # TODO: condition variable
         while (not self.DATASENT) and time.time() - txStart < RF69_TX_LIMIT_S:
             time.sleep(0.01)
         # TODO: Set to receive?
-        # self.setMode(RF69_MODE_RX)
-        self.setMode(RF69_MODE_STANDBY)
+        self.setMode(RF69_MODE_RX)
+        # self.setMode(RF69_MODE_STANDBY)
 
     def interruptHandler(self, pin):
         # TODO: Use threading locks?
+        _LOGGER.warning("Interrupt on pin %d in mode %d" % (pin, self.mode))
         with self.lock:
             self.DATASENT = True
             if self.mode == RF69_MODE_RX and self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY:
                 self.setMode(RF69_MODE_STANDBY)
                 self.PAYLOADLEN, self.TARGETID, self.SENDERID, headerID, CTLbyte = self.spi.xfer2([REG_FIFO & 0x7f,0,0,0,0,0])[1:]
+                _LOGGER.warning("Interrupt: Packet {0} {1} {2} {3} {4}".format(self.PAYLOADLEN, self.TARGETID, self.SENDERID, headerID, CTLbyte))
                 # print("Interrupt: ", self.PAYLOADLEN, self.TARGETID, self.SENDERID, headerID, CTLbyte)
                 # TODO: Implement CTLbyte in whisper node
                 if self.PAYLOADLEN > 66:
@@ -473,8 +478,10 @@ class RFM69(object):
                 if not (self.promiscuousMode or self.TARGETID == self.address or self.TARGETID == RF69_BROADCAST_ADDR) or self.PAYLOADLEN < 4:
                     self.PAYLOADLEN = 0
                     self.receiveBegin()
+                    _LOGGER.warning("Invalid packet {0} {1} {2}".format(self.address, self.TARGETID, self.PAYLOADLEN0))
                     return
                 self.DATALEN = self.PAYLOADLEN - 4
+                # TODO: Return ACK
                 self.ACK_RECEIVED = CTLbyte & RFM69_CTL_SENDACK
                 self.ACK_REQUESTED = CTLbyte & RFM69_CTL_REQACK
 
@@ -482,8 +489,11 @@ class RFM69(object):
                 self.DATA = self.spi.xfer2([REG_FIFO & 0x7f] + [0 for _ in range(self.DATALEN)])[1:]
                 self.setMode(RF69_MODE_RX)
 
-            self.RSSI = self.readRSSI()
-        self.callback()
+                self.RSSI = self.readRSSI()
+                if self.DATALEN > 0:
+                    self.callback()
+            else:
+                self.RSSI = self.readRSSI()
 
     def receiveBegin(self):
         self.DATALEN = 0
@@ -1575,7 +1585,7 @@ RF_PACKET1_ADRSFILTERING_NODEBROADCAST = 0x04  # Address field must match NodeAd
 RF_PAYLOADLENGTH_VALUE = 0x40  # Default
 
 # RegBroadcastAdrs (0x3A) - Broadcast address used in address filtering
-RF_BROADCASTADDRESS_VALUE = 0x00: # Default
+RF_BROADCASTADDRESS_VALUE = 0x00 # Default
 
 
 # RegAutoModes (0x3B)
