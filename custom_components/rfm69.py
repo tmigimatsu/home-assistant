@@ -63,37 +63,50 @@ def setup(hass, config):
 class ExpireQueue:
 
     def __init__(self, timeout=10):
-        self.lock = threading.RLock()
-        self.timeout = timeout
-        self.queue = collections.deque()
+        self._lock    = threading.RLock()    # Allow same thread to acquire lock multiple times
+        self._timeout = timeout              # Message timeout
+        self._queue   = collections.deque()  # Message queue
+
+    def _flush(self, t_curr):
+        with self._lock:
+            while self._queue and t_curr - self._queue[0][1] > self._timeout:
+                self._queue.popleft()
 
     def put(self, item):
-        # print("Put ", item)
-        with self.lock:
-            self.flush()
-            self.queue.append((time.time(), item))
-
-    def flush(self):
-        with self.lock:
+        """
+        Push item to queue.
+        """
+        with self._lock:
             t_curr = time.time()
-            while self.queue and t_curr - self.queue[0][0] > self.timeout:
-                self.queue.popleft()
+            self._flush(t_curr)
+            self._queue.append((item, t_curr))
 
-    def get(self, block=False, timeout=1):
-        if block:
-            t_start = time.time()
+    def get(self, block=False, timeout=1, retry_interval=0.1):
+        """
+        Pop item from queue.
+
+        Args:
+            block          (Bool)  - If True, wait for message. If False, return immediately.
+            timeout        (float) - Seconds to block on message.
+            retry_interval (float) - Seconds between message pop retries.
+
+        Returns:
+            (item, t_wait) - Seconds item was left in the queue.
+        """
+        t_start = time.time()
 
         while True:
-            with self.lock:
-                self.flush()
-                if self.queue:
-                    item = self.queue.popleft()
-                    return item[1], time.time() - item[0]
+            with self._lock:
+                t_curr = time.time()
+                self._flush(t_curr)
+                if self._queue:
+                    item = self._queue.popleft()
+                    return item[0], t_curr - item[1]
 
-            if not block or time.time() - t_start > timeout:
-                return None, timeout
+            if not block or t_curr - t_start > timeout:
+                return None, t_curr - t_start
 
-            time.sleep(0.1)
+            time.sleep(retry_interval)
 
 class Rfm69hcw(object):
     """Representation of an RFM69HCW chip."""
@@ -129,7 +142,8 @@ class Rfm69hcw(object):
 
         if self._rfm69.ACK_REQUESTED:
             self._rfm69.sendACK(id_sender)
-        self._rfm69.receiveBegin()
+        # TODO: Changed from receiveBegin?
+        self._rfm69.receiveDone()
 
 
     def receive_message(self, node_id, time_wait_sec=1.0, message_to_cache=None):
@@ -171,7 +185,7 @@ class Rfm69hcw(object):
 
 class RFM69(object):
 
-    def __init__(self, freqBand, nodeID, networkID, isRFM69HW = False, intPin = 18, rstPin = 28, spiBus = 0, spiDevice = 0, interrupt_callback=None):
+    def __init__(self, freqBand, nodeID, networkID, isRFM69HW=False, intPin=18, rstPin=28, spiBus=0, spiDevice=0, interrupt_callback=None):
         import spidev
         import RPi.GPIO as GPIO
         import threading
@@ -348,9 +362,10 @@ class RFM69(object):
         self.writeReg(REG_PALEVEL, (self.readReg(REG_PALEVEL) & 0xE0) | self.powerLevel)
 
     def canSend(self):
-        if self.mode == RF69_MODE_STANDBY:
-            self.receiveBegin()
-            return True
+        # TODO: Following 3 lines unnecessary?
+        # if self.mode == RF69_MODE_STANDBY:
+        #     self.receiveBegin()
+        #     return True
         #if signal stronger than -100dBm is detected assume channel activity
         elif self.mode == RF69_MODE_RX and self.PAYLOADLEN == 0 and self.readRSSI() < CSMA_LIMIT:
             self.setMode(RF69_MODE_STANDBY)
@@ -390,10 +405,25 @@ class RFM69(object):
         return self.ACK_REQUESTED and self.TARGETID != RF69_BROADCAST_ADDR
 
     def sendACK(self, toAddress = 0, buff = ""):
-        toAddress = toAddress if toAddress > 0 else self.SENDERID
-        while not self.canSend():
+        # TWS added to make sure we don't end up in a timing race and infinite loop sending Acks
+        self.ACK_REQUESTED = 0
+        sender = self.SENDERID
+        RSSI = self.RSSI  # Save payload received RSSI value
+        self.writeReg(REG_PACKETCONFIG2, (self.readReg(REG_PACKETCONFIG2) & 0xFB | RF_PACKET2_RXRESTART))  # Avoid RX deadlocks
+        now = time.time()
+        while (not self.canSend()) and time.time() - now < RF69_CSMA_LIMIT_S:
             self.receiveDone()
-        self.sendFrame(toAddress, buff, False, True)
+            time.sleep(0.01)
+        self.SENDERID = sender  # TWS: Restore SenderID after it gets wiped out by receiveDone()
+        self.sendFrame(sender, buff, False, True)
+        self.RSSI = RSSI  # Restore payload RSSI
+
+        # TODO: Old code?
+        # with self.lock:
+        # toAddress = toAddress if toAddress > 0 else self.SENDERID
+        # while not self.canSend():
+        #     self.receiveDone()
+        # self.sendFrame(toAddress, buff, False, True)
 
     def sendFrame(self, toAddress, buff, requestACK, sendACK):
         #turn off receiver to prevent reception while filling fifo
@@ -407,26 +437,27 @@ class RFM69(object):
         # DIO0 is "Packet Sent"
         self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_00)
 
-        if (len(buff) > RF69_MAX_DATA_LEN):
-            buff = buff[0:RF69_MAX_DATA_LEN]
+        if len(buff) > RF69_MAX_DATA_LEN:
+            buff = buff[:RF69_MAX_DATA_LEN]
 
         ack = 0
         if sendACK:
-            ack = 0x80
+            ack = RFM69_CTL_SENDACK
         elif requestACK:
-            ack = 0x40
+            ack = RFM69_CTL_REQACK
         if isinstance(buff, str):
             self.spi.xfer2([REG_FIFO | 0x80, len(buff) + 4, toAddress, self.address, 0, ack] + [int(ord(i)) for i in list(buff)])
         else:
             self.spi.xfer2([REG_FIFO | 0x80, len(buff) + 4, toAddress, self.address, 0, ack] + buff)
 
-        startTime = time.time()
         self.DATASENT = False
         self.setMode(RF69_MODE_TX)
-        while not self.DATASENT:
-            if time.time() - startTime > 1.0:
-                break
-        self.setMode(RF69_MODE_RX)
+        txStart = time.time()
+        while (not self.DATASENT) and time.time() - txStart < RF69_TX_LIMIT_S:
+            time.sleep(0.01)
+        # TODO: Set to receive?
+        # self.setMode(RF69_MODE_RX)
+        self.setMode(RF69_MODE_STANDBY)
 
     def interruptHandler(self, pin):
         # TODO: Use threading locks?
@@ -439,59 +470,54 @@ class RFM69(object):
                 # TODO: Implement CTLbyte in whisper node
                 if self.PAYLOADLEN > 66:
                     self.PAYLOADLEN = 66
-                if not (self.promiscuousMode or self.TARGETID == self.address or self.TARGETID == RF69_BROADCAST_ADDR):
+                if not (self.promiscuousMode or self.TARGETID == self.address or self.TARGETID == RF69_BROADCAST_ADDR) or self.PAYLOADLEN < 4:
                     self.PAYLOADLEN = 0
+                    self.receiveBegin()
                     return
                 self.DATALEN = self.PAYLOADLEN - 4
-                self.ACK_RECEIVED = CTLbyte & 0x80
-                self.ACK_REQUESTED = CTLbyte & 0x40
+                self.ACK_RECEIVED = CTLbyte & RFM69_CTL_SENDACK
+                self.ACK_REQUESTED = CTLbyte & RFM69_CTL_REQACK
 
-                self.DATA = self.spi.xfer2([REG_FIFO & 0x7f] + [0 for i in range(0, self.DATALEN)])[1:]
+                # TODO: Why first element?
+                self.DATA = self.spi.xfer2([REG_FIFO & 0x7f] + [0 for _ in range(self.DATALEN)])[1:]
+                self.setMode(RF69_MODE_RX)
 
-                self.RSSI = self.readRSSI()
+            self.RSSI = self.readRSSI()
         self.callback()
 
     def receiveBegin(self):
-        with self.lock:
-            self.DATALEN = 0
-            self.SENDERID = 0
-            self.TARGETID = 0
-            self.PAYLOADLEN = 0
-            self.ACK_REQUESTED = 0
-            self.ACK_RECEIVED = 0
-            self.RSSI = 0
-            if (self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY):
-                # avoid RX deadlocks
-                self.writeReg(REG_PACKETCONFIG2, (self.readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART)
-            #set DIO0 to "PAYLOADREADY" in receive mode
-            self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01)
-            self.setMode(RF69_MODE_RX)
+        self.DATALEN = 0
+        self.SENDERID = 0
+        self.TARGETID = 0
+        self.PAYLOADLEN = 0
+        self.ACK_REQUESTED = 0
+        self.ACK_RECEIVED = 0
+        self.RSSI = 0
+        if (self.readReg(REG_IRQFLAGS2) & RF_IRQFLAGS2_PAYLOADREADY):
+            # Avoid RX deadlocks
+            self.writeReg(REG_PACKETCONFIG2, (self.readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART)
+        # Set DIO0 to "PAYLOADREADY" in receive mode
+        self.writeReg(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01)
+        self.setMode(RF69_MODE_RX)
 
     def receiveDone(self):
-        if (self.mode == RF69_MODE_RX or self.mode == RF69_MODE_STANDBY) and self.PAYLOADLEN > 0:
-            self.setMode(RF69_MODE_STANDBY)
-            # self.receiveBegin()
-            return True
-        if self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_TIMEOUT:
-            # https://github.com/russss/rfm69-python/blob/master/rfm69/rfm69.py#L112
-            # Russss figured out that if you leave alone long enough it times out
-            # tell it to stop being silly and listen for more packets
-            self.writeReg(REG_PACKETCONFIG2, (self.readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART)
-        elif self.mode == RF69_MODE_RX:
-            # already in RX no payload yet
-            return False
+        # TODO: Standby?
+        # if (self.mode == RF69_MODE_RX or self.mode == RF69_MODE_STANDBY) and self.PAYLOADLEN > 0:
+        with self.lock:
+            if self.mode == RF69_MODE_RX and self.PAYLOADLEN > 0:
+                self.setMode(RF69_MODE_STANDBY)
+                # self.receiveBegin()
+                return True
+            if self.readReg(REG_IRQFLAGS1) & RF_IRQFLAGS1_TIMEOUT:
+                # https://github.com/russss/rfm69-python/blob/master/rfm69/rfm69.py#L112
+                # Russss figured out that if you leave alone long enough it times out
+                # tell it to stop being silly and listen for more packets
+                self.writeReg(REG_PACKETCONFIG2, (self.readReg(REG_PACKETCONFIG2) & 0xFB) | RF_PACKET2_RXRESTART)
+            elif self.mode == RF69_MODE_RX:
+                # already in RX no payload yet
+                return False
         self.receiveBegin()
         return False
-
-    def readRSSI(self, forceTrigger = False):
-        rssi = 0
-        if forceTrigger:
-            self.writeReg(REG_RSSICONFIG, RF_RSSI_START)
-            while self.readReg(REG_RSSICONFIG) & RF_RSSI_DONE == 0x00:
-                pass
-        rssi = self.readReg(REG_RSSIVALUE) * -1
-        rssi = rssi >> 1
-        return rssi
 
     def encrypt(self, key):
         self.setMode(RF69_MODE_STANDBY)
@@ -500,6 +526,16 @@ class RFM69(object):
             self.writeReg(REG_PACKETCONFIG2,(self.readReg(REG_PACKETCONFIG2) & 0xFE) | RF_PACKET2_AES_ON)
         else:
             self.writeReg(REG_PACKETCONFIG2,(self.readReg(REG_PACKETCONFIG2) & 0xFE) | RF_PACKET2_AES_OFF)
+
+    def readRSSI(self, forceTrigger = False):
+        rssi = 0
+        if forceTrigger:
+            self.writeReg(REG_RSSICONFIG, RF_RSSI_START)
+            while self.readReg(REG_RSSICONFIG) & RF_RSSI_DONE == 0x00:
+                pass
+        rssi = -self.readReg(REG_RSSIVALUE)
+        rssi = rssi >> 1
+        return rssi
 
     def readReg(self, addr):
         return self.spi.xfer([addr & 0x7F, 0])[1]
@@ -555,216 +591,219 @@ class RFM69(object):
         self.sleep()
         GPIO.cleanup()
 
-REG_FIFO = 0x00
-REG_OPMODE = 0x01
-REG_DATAMODUL = 0x02
-REG_BITRATEMSB = 0x03
-REG_BITRATELSB = 0x04
-REG_FDEVMSB = 0x05
-REG_FDEVLSB = 0x06
-REG_FRFMSB = 0x07
-REG_FRFMID = 0x08
-REG_FRFLSB = 0x09
-REG_OSC1 = 0x0A
-REG_AFCCTRL = 0x0B
-REG_LOWBAT = 0x0C
-REG_LISTEN1 = 0x0D
-REG_LISTEN2 = 0x0E
-REG_LISTEN3 = 0x0F
-REG_VERSION = 0x10
-REG_PALEVEL = 0x11
-REG_PARAMP = 0x12
-REG_OCP = 0x13
-REG_AGCREF = 0x14
-REG_AGCTHRESH1 = 0x15
-REG_AGCTHRESH2 = 0x16
-REG_AGCTHRESH3 = 0x17
-REG_LNA = 0x18
-REG_RXBW = 0x19
-REG_AFCBW = 0x1A
-REG_OOKPEAK = 0x1B
-REG_OOKAVG = 0x1C
-REG_OOKFIX = 0x1D
-REG_AFCFEI = 0x1E
-REG_AFCMSB = 0x1F
-REG_AFCLSB = 0x20
-REG_FEIMSB = 0x21
-REG_FEILSB = 0x22
-REG_RSSICONFIG = 0x23
-REG_RSSIVALUE = 0x24
-REG_DIOMAPPING1 = 0x25
-REG_DIOMAPPING2 = 0x26
-REG_IRQFLAGS1 = 0x27
-REG_IRQFLAGS2 = 0x28
-REG_RSSITHRESH = 0x29
-REG_RXTIMEOUT1 = 0x2A
-REG_RXTIMEOUT2 = 0x2B
-REG_PREAMBLEMSB = 0x2C
-REG_PREAMBLELSB = 0x2D
-REG_SYNCCONFIG = 0x2E
-REG_SYNCVALUE1 = 0x2F
-REG_SYNCVALUE2 = 0x30
-REG_SYNCVALUE3 = 0x31
-REG_SYNCVALUE4 = 0x32
-REG_SYNCVALUE5 = 0x33
-REG_SYNCVALUE6 = 0x34
-REG_SYNCVALUE7 = 0x35
-REG_SYNCVALUE8 = 0x36
-REG_PACKETCONFIG1 = 0x37
-REG_PAYLOADLENGTH = 0x38
-REG_NODEADRS = 0x39
-REG_BROADCASTADRS = 0x3A
-REG_AUTOMODES = 0x3B
-REG_FIFOTHRESH = 0x3C
-REG_PACKETCONFIG2 = 0x3D
-REG_AESKEY1 = 0x3E
-REG_AESKEY2 = 0x3F
-REG_AESKEY3 = 0x40
-REG_AESKEY4 = 0x41
-REG_AESKEY5 = 0x42
-REG_AESKEY6 = 0x43
-REG_AESKEY7 = 0x44
-REG_AESKEY8 = 0x45
-REG_AESKEY9 = 0x46
-REG_AESKEY10 = 0x47
-REG_AESKEY11 = 0x48
-REG_AESKEY12 = 0x49
-REG_AESKEY13 = 0x4A
-REG_AESKEY14 = 0x4B
-REG_AESKEY15 = 0x4C
-REG_AESKEY16 = 0x4D
-REG_TEMP1 = 0x4E
-REG_TEMP2 = 0x4F
-REG_TESTPA1 = 0x5A #only present on RFM69HW/SX1231H
-REG_TESTPA2 = 0x5C #only present on RFM69HW/SX1231H
-REG_TESTDAGC = 0x6F
+REG_FIFO          = 0x00  # FIFO read/write access
+REG_OPMODE        = 0x01  # Operating modes of the transceiver
+REG_DATAMODUL     = 0x02  # Data operation mode and Modulation settings
+REG_BITRATEMSB    = 0x03  # Bit rate setting, Most Significant Bits
+REG_BITRATELSB    = 0x04  # Bit rate setting, Least Significant Bits
+REG_FDEVMSB       = 0x05  # Frequency Deviation setting, Most Significant Bits
+REG_FDEVLSB       = 0x06  # Frequency Deviation setting, Least Significant Bits
+REG_FRFMSB        = 0x07  # RF Carrier Frequency, Most Significant Bits
+REG_FRFMID        = 0x08  # RF Carrier Frequency, Intermediate Bits
+REG_FRFLSB        = 0x09  # RF Carrier Frequency, Least Significant Bits
+REG_OSC1          = 0x0A  # RC Oscillator Settings
+REG_AFCCTRL       = 0x0B  # AFC control in low modulation index situations
+REG_LOWBAT        = 0x0C  # - reserved
+REG_LISTEN1       = 0x0D  # Listen Mode settings
+REG_LISTEN2       = 0x0E  # Listen Mode Idle duration
+REG_LISTEN3       = 0x0F  # Listen Mode RX duration
+REG_VERSION       = 0x10
+REG_PALEVEL       = 0x11  # PA selection and Output Power control
+REG_PARAMP        = 0x12  # Control of the PA ramp time in FSK mode
+REG_OCP           = 0x13  # Over Current Protection control
+REG_AGCREF        = 0x14  # - reserved
+REG_AGCTHRESH1    = 0x15  # - reserved
+REG_AGCTHRESH2    = 0x16  # - reserved
+REG_AGCTHRESH3    = 0x17  # - reserved
+REG_LNA           = 0x18  # LNA settings
+REG_RXBW          = 0x19  # Channel Filter BW Control
+REG_AFCBW         = 0x1A  # Channel Filter BW control during the AFC routine
+REG_OOKPEAK       = 0x1B  # OOK demodulator selection and control in peak mode
+REG_OOKAVG        = 0x1C  # Average threshold control of the OOK demodulator
+REG_OOKFIX        = 0x1D  # Fixed threshold control of the OOK demodulator
+REG_AFCFEI        = 0x1E  # AFC and FEI control and status
+REG_AFCMSB        = 0x1F  # MSB of the frequency correction of the AFC
+REG_AFCLSB        = 0x20  # LSB of the frequency correction of the AFC
+REG_FEIMSB        = 0x21  # MSB of the calculated frequency error
+REG_FEILSB        = 0x22  # LSB of the calculated frequency error
+REG_RSSICONFIG    = 0x23  # RSSI-related settings
+REG_RSSIVALUE     = 0x24  # RSSI value in dBm
+REG_DIOMAPPING1   = 0x25  # Mapping of pins DIO0 to DIO3
+REG_DIOMAPPING2   = 0x26  # Mapping of pins DIO4 and DIO5, ClkOut frequency
+REG_IRQFLAGS1     = 0x27  # Status register: PLL Lock state, Timeout, RSSI > Threshold...
+REG_IRQFLAGS2     = 0x28  # Status register: FIFO handling flags...
+REG_RSSITHRESH    = 0x29  # RSSI Threshold control
+REG_RXTIMEOUT1    = 0x2A  # Timeout duration between Rx request and RSSI detection
+REG_RXTIMEOUT2    = 0x2B  # Timeout duration between RSSI detection and PayloadReady
+REG_PREAMBLEMSB   = 0x2C  # Preamble length, MSB
+REG_PREAMBLELSB   = 0x2D  # Preamble length, LSB
+REG_SYNCCONFIG    = 0x2E  # Sync Word Recognition control
+REG_SYNCVALUE1    = 0x2F  # Sync Word byte 1
+REG_SYNCVALUE2    = 0x30  # Sync Word byte 2
+REG_SYNCVALUE3    = 0x31  # Sync Word byte 3
+REG_SYNCVALUE4    = 0x32  # Sync Word byte 4
+REG_SYNCVALUE5    = 0x33  # Sync Word byte 5
+REG_SYNCVALUE6    = 0x34  # Sync Word byte 6
+REG_SYNCVALUE7    = 0x35  # Sync Word byte 7
+REG_SYNCVALUE8    = 0x36  # Sync Word byte 8
+REG_PACKETCONFIG1 = 0x37  # Packet mode settings
+REG_PAYLOADLENGTH = 0x38  # Payload length setting
+REG_NODEADRS      = 0x39  # Node address
+REG_BROADCASTADRS = 0x3A  # Broadcast address
+REG_AUTOMODES     = 0x3B  # Auto modes settings
+REG_FIFOTHRESH    = 0x3C  # Fifo threshold, Tx start condition
+REG_PACKETCONFIG2 = 0x3D  # Packet mode settings
+REG_AESKEY1       = 0x3E  # Byte 1 of the cypher key
+REG_AESKEY2       = 0x3F  # Byte 2 of the cypher key
+REG_AESKEY3       = 0x40  # Byte 3 of the cypher key
+REG_AESKEY4       = 0x41  # Byte 4 of the cypher key
+REG_AESKEY5       = 0x42  # Byte 5 of the cypher key
+REG_AESKEY6       = 0x43  # Byte 6 of the cypher key
+REG_AESKEY7       = 0x44  # Byte 7 of the cypher key
+REG_AESKEY8       = 0x45  # Byte 8 of the cypher key
+REG_AESKEY9       = 0x46  # Byte 9 of the cypher key
+REG_AESKEY10      = 0x47  # Byte 10 of the cypher key
+REG_AESKEY11      = 0x48  # Byte 11 of the cypher key
+REG_AESKEY12      = 0x49  # Byte 12 of the cypher key
+REG_AESKEY13      = 0x4A  # Byte 13 of the cypher key
+REG_AESKEY14      = 0x4B  # Byte 14 of the cypher key
+REG_AESKEY15      = 0x4C  # Byte 15 of the cypher key
+REG_AESKEY16      = 0x4D  # Byte 16 of the cypher key
+REG_TEMP1         = 0x4E  # Temperature Sensor control
+REG_TEMP2         = 0x4F  # Temperature readout
+REG_TESTLNA       = 0x58  # Sensitivity boost
+REG_TESTPA1       = 0x5A  # High Power PA settings (only present on RFM69HW/SX1231H)
+REG_TESTPA2       = 0x5C  # High Power PA settings (only present on RFM69HW/SX1231H)
+REG_TESTDAGC      = 0x6F  # Fading Margin Improvement
+REG_TESTAFC       = 0x71  # AFC offset for low modulation index AFC
 
 #******************************************************
 # RF69/SX1231 bit control definition
 #******************************************************
-# RegOpMode
-RF_OPMODE_SEQUENCER_OFF = 0x80
-RF_OPMODE_SEQUENCER_ON = 0x00  # Default
 
-RF_OPMODE_LISTEN_ON = 0x40
-RF_OPMODE_LISTEN_OFF = 0x00  # Default
+# RegOpMode (0x01)
+RF_OPMODE_SEQUENCER_ON  = 0x00  # Default: Operation mode as selected with Mode bits in RegOpMode is automatically reached with the Sequencer
+RF_OPMODE_SEQUENCER_OFF = 0x80  # Mode is forced by the user
 
-RF_OPMODE_LISTENABORT = 0x20
+RF_OPMODE_LISTEN_OFF    = 0x00  # Default: Off
+RF_OPMODE_LISTEN_ON     = 0x40  # On
 
-RF_OPMODE_SLEEP = 0x00
-RF_OPMODE_STANDBY = 0x04  # Default
-RF_OPMODE_SYNTHESIZER = 0x08
-RF_OPMODE_TRANSMITTER = 0x0C
-RF_OPMODE_RECEIVER = 0x10
+RF_OPMODE_LISTENABORT   = 0x20  # Aborts Listen mode when set together with ListenOn=0. Always reads 0.
 
-# RegDataModul
-RF_DATAMODUL_DATAMODE_PACKET = 0x00  # Default
-RF_DATAMODUL_DATAMODE_CONTINUOUS = 0x40
-RF_DATAMODUL_DATAMODE_CONTINUOUSNOBSYNC = 0x60
+RF_OPMODE_SLEEP         = 0x00  # Sleep mode (SLEEP)
+RF_OPMODE_STANDBY       = 0x04  # Default: Standby mode (STDBY)
+RF_OPMODE_SYNTHESIZER   = 0x08  # Frequency Synthesizer mode (FS)
+RF_OPMODE_TRANSMITTER   = 0x0C  # Transmitter mode (TX)
+RF_OPMODE_RECEIVER      = 0x10  # Receiver mode (RX)
 
-RF_DATAMODUL_MODULATIONTYPE_FSK = 0x00  # Default
-RF_DATAMODUL_MODULATIONTYPE_OOK = 0x08
+# RegDataModul (0x02)
+RF_DATAMODUL_DATAMODE_PACKET            = 0x00  # Default: Packet mode
+RF_DATAMODUL_DATAMODE_CONTINUOUS        = 0x40  # Continuous mode with bit synchronizer
+RF_DATAMODUL_DATAMODE_CONTINUOUSNOBSYNC = 0x60  # Continuous mode without bit synchronizer
 
-RF_DATAMODUL_MODULATIONSHAPING_00 = 0x00  # Default
-RF_DATAMODUL_MODULATIONSHAPING_01 = 0x01
-RF_DATAMODUL_MODULATIONSHAPING_10 = 0x02
-RF_DATAMODUL_MODULATIONSHAPING_11 = 0x03
+RF_DATAMODUL_MODULATIONTYPE_FSK         = 0x00  # Default: FSK modulation scheme
+RF_DATAMODUL_MODULATIONTYPE_OOK         = 0x08  # OOK modulation scheme
 
-# RegBitRate (bits/sec) example bit rates
-RF_BITRATEMSB_1200 = 0x68
-RF_BITRATELSB_1200 = 0x2B
-RF_BITRATEMSB_2400 = 0x34
-RF_BITRATELSB_2400 = 0x15
-RF_BITRATEMSB_4800 = 0x1A  # Default
-RF_BITRATELSB_4800 = 0x0B  # Default
-RF_BITRATEMSB_9600 = 0x0D
-RF_BITRATELSB_9600 = 0x05
-RF_BITRATEMSB_19200 = 0x06
-RF_BITRATELSB_19200 = 0x83
-RF_BITRATEMSB_38400 = 0x03
-RF_BITRATELSB_38400 = 0x41
+RF_DATAMODUL_MODULATIONSHAPING_00       = 0x00  # Default: No shaping
+RF_DATAMODUL_MODULATIONSHAPING_01       = 0x01  # FSK: Gaussian filter, BT = 1.0; OOK: Filtering with f_cutoff = BR
+RF_DATAMODUL_MODULATIONSHAPING_10       = 0x02  # FSK: Gaussian filter, BT = 0.5; OOK: Filtering with f_cutoff = 2*BR
+RF_DATAMODUL_MODULATIONSHAPING_11       = 0x03  # FSK: Gaussian filter, BT = 0.3; OOK: Reserved
 
-RF_BITRATEMSB_38323 = 0x03
-RF_BITRATELSB_38323 = 0x43
+# RegBitRate (0x03, 0x04) - Bit Rate [bits/sec] (Chip Rate when Manchester encoding is enabled)
+RF_BITRATEMSB_1200    = 0x68
+RF_BITRATELSB_1200    = 0x2B
+RF_BITRATEMSB_2400    = 0x34
+RF_BITRATELSB_2400    = 0x15
+RF_BITRATEMSB_4800    = 0x1A  # Default
+RF_BITRATELSB_4800    = 0x0B  # Default
+RF_BITRATEMSB_9600    = 0x0D
+RF_BITRATELSB_9600    = 0x05
+RF_BITRATEMSB_19200   = 0x06
+RF_BITRATELSB_19200   = 0x83
+RF_BITRATEMSB_38400   = 0x03
+RF_BITRATELSB_38400   = 0x41
 
-RF_BITRATEMSB_34482 = 0x03
-RF_BITRATELSB_34482 = 0xA0
+RF_BITRATEMSB_38323   = 0x03
+RF_BITRATELSB_38323   = 0x43
 
-RF_BITRATEMSB_76800 = 0x01
-RF_BITRATELSB_76800 = 0xA1
-RF_BITRATEMSB_153600 = 0x00
-RF_BITRATELSB_153600 = 0xD0
-RF_BITRATEMSB_57600 = 0x02
-RF_BITRATELSB_57600 = 0x2C
-RF_BITRATEMSB_115200 = 0x01
-RF_BITRATELSB_115200 = 0x16
-RF_BITRATEMSB_12500 = 0x0A
-RF_BITRATELSB_12500 = 0x00
-RF_BITRATEMSB_25000 = 0x05
-RF_BITRATELSB_25000 = 0x00
-RF_BITRATEMSB_50000 = 0x02
-RF_BITRATELSB_50000 = 0x80
-RF_BITRATEMSB_100000 = 0x01
-RF_BITRATELSB_100000 = 0x40
-RF_BITRATEMSB_150000 = 0x00
-RF_BITRATELSB_150000 = 0xD5
-RF_BITRATEMSB_200000 = 0x00
-RF_BITRATELSB_200000 = 0xA0
-RF_BITRATEMSB_250000 = 0x00
-RF_BITRATELSB_250000 = 0x80
-RF_BITRATEMSB_300000 = 0x00
-RF_BITRATELSB_300000 = 0x6B
-RF_BITRATEMSB_32768 = 0x03
-RF_BITRATELSB_32768 = 0xD1
+RF_BITRATEMSB_34482   = 0x03
+RF_BITRATELSB_34482   = 0xA0
+
+RF_BITRATEMSB_76800   = 0x01
+RF_BITRATELSB_76800   = 0xA1
+RF_BITRATEMSB_153600  = 0x00
+RF_BITRATELSB_153600  = 0xD0
+RF_BITRATEMSB_57600   = 0x02
+RF_BITRATELSB_57600   = 0x2C
+RF_BITRATEMSB_115200  = 0x01
+RF_BITRATELSB_115200  = 0x16
+RF_BITRATEMSB_12500   = 0x0A
+RF_BITRATELSB_12500   = 0x00
+RF_BITRATEMSB_25000   = 0x05
+RF_BITRATELSB_25000   = 0x00
+RF_BITRATEMSB_50000   = 0x02
+RF_BITRATELSB_50000   = 0x80
+RF_BITRATEMSB_100000  = 0x01
+RF_BITRATELSB_100000  = 0x40
+RF_BITRATEMSB_150000  = 0x00
+RF_BITRATELSB_150000  = 0xD5
+RF_BITRATEMSB_200000  = 0x00
+RF_BITRATELSB_200000  = 0xA0
+RF_BITRATEMSB_250000  = 0x00
+RF_BITRATELSB_250000  = 0x80
+RF_BITRATEMSB_300000  = 0x00
+RF_BITRATELSB_300000  = 0x6B
+RF_BITRATEMSB_32768   = 0x03
+RF_BITRATELSB_32768   = 0xD1
 #custom bit rates
-RF_BITRATEMSB_55555 = 0x02
-RF_BITRATELSB_55555 = 0x40
+RF_BITRATEMSB_55555   = 0x02
+RF_BITRATELSB_55555   = 0x40
 RF_BITRATEMSB_200KBPS = 0x00
 RF_BITRATELSB_200KBPS = 0xa0
 
-# RegFdev - frequency deviation (Hz)
-RF_FDEVMSB_2000 = 0x00
-RF_FDEVLSB_2000 = 0x21
-RF_FDEVMSB_5000 = 0x00  # Default
-RF_FDEVLSB_5000 = 0x52  # Default
-RF_FDEVMSB_7500 = 0x00
-RF_FDEVLSB_7500 = 0x7B
-RF_FDEVMSB_10000 = 0x00
-RF_FDEVLSB_10000 = 0xA4
-RF_FDEVMSB_15000 = 0x00
-RF_FDEVLSB_15000 = 0xF6
-RF_FDEVMSB_20000 = 0x01
-RF_FDEVLSB_20000 = 0x48
-RF_FDEVMSB_25000 = 0x01
-RF_FDEVLSB_25000 = 0x9A
-RF_FDEVMSB_30000 = 0x01
-RF_FDEVLSB_30000 = 0xEC
-RF_FDEVMSB_35000 = 0x02
-RF_FDEVLSB_35000 = 0x3D
-RF_FDEVMSB_40000 = 0x02
-RF_FDEVLSB_40000 = 0x8F
-RF_FDEVMSB_45000 = 0x02
-RF_FDEVLSB_45000 = 0xE1
-RF_FDEVMSB_50000 = 0x03
-RF_FDEVLSB_50000 = 0x33
-RF_FDEVMSB_55000 = 0x03
-RF_FDEVLSB_55000 = 0x85
-RF_FDEVMSB_60000 = 0x03
-RF_FDEVLSB_60000 = 0xD7
-RF_FDEVMSB_65000 = 0x04
-RF_FDEVLSB_65000 = 0x29
-RF_FDEVMSB_70000 = 0x04
-RF_FDEVLSB_70000 = 0x7B
-RF_FDEVMSB_75000 = 0x04
-RF_FDEVLSB_75000 = 0xCD
-RF_FDEVMSB_80000 = 0x05
-RF_FDEVLSB_80000 = 0x1F
-RF_FDEVMSB_85000 = 0x05
-RF_FDEVLSB_85000 = 0x71
-RF_FDEVMSB_90000 = 0x05
-RF_FDEVLSB_90000 = 0xC3
-RF_FDEVMSB_95000 = 0x06
-RF_FDEVLSB_95000 = 0x14
+# RegFdev (0x05, 0x06) - Frequency deviation [Hz]
+RF_FDEVMSB_2000   = 0x00
+RF_FDEVLSB_2000   = 0x21
+RF_FDEVMSB_5000   = 0x00  # Default
+RF_FDEVLSB_5000   = 0x52  # Default
+RF_FDEVMSB_7500   = 0x00
+RF_FDEVLSB_7500   = 0x7B
+RF_FDEVMSB_10000  = 0x00
+RF_FDEVLSB_10000  = 0xA4
+RF_FDEVMSB_15000  = 0x00
+RF_FDEVLSB_15000  = 0xF6
+RF_FDEVMSB_20000  = 0x01
+RF_FDEVLSB_20000  = 0x48
+RF_FDEVMSB_25000  = 0x01
+RF_FDEVLSB_25000  = 0x9A
+RF_FDEVMSB_30000  = 0x01
+RF_FDEVLSB_30000  = 0xEC
+RF_FDEVMSB_35000  = 0x02
+RF_FDEVLSB_35000  = 0x3D
+RF_FDEVMSB_40000  = 0x02
+RF_FDEVLSB_40000  = 0x8F
+RF_FDEVMSB_45000  = 0x02
+RF_FDEVLSB_45000  = 0xE1
+RF_FDEVMSB_50000  = 0x03
+RF_FDEVLSB_50000  = 0x33
+RF_FDEVMSB_55000  = 0x03
+RF_FDEVLSB_55000  = 0x85
+RF_FDEVMSB_60000  = 0x03
+RF_FDEVLSB_60000  = 0xD7
+RF_FDEVMSB_65000  = 0x04
+RF_FDEVLSB_65000  = 0x29
+RF_FDEVMSB_70000  = 0x04
+RF_FDEVLSB_70000  = 0x7B
+RF_FDEVMSB_75000  = 0x04
+RF_FDEVLSB_75000  = 0xCD
+RF_FDEVMSB_80000  = 0x05
+RF_FDEVLSB_80000  = 0x1F
+RF_FDEVMSB_85000  = 0x05
+RF_FDEVLSB_85000  = 0x71
+RF_FDEVMSB_90000  = 0x05
+RF_FDEVLSB_90000  = 0xC3
+RF_FDEVMSB_95000  = 0x06
+RF_FDEVLSB_95000  = 0x14
 RF_FDEVMSB_100000 = 0x06
 RF_FDEVLSB_100000 = 0x66
 RF_FDEVMSB_110000 = 0x07
@@ -808,7 +847,7 @@ RF_FDEVLSB_290000 = 0x8F
 RF_FDEVMSB_300000 = 0x13
 RF_FDEVLSB_300000 = 0x33
 
-# RegFrf (MHz) - carrier frequency
+# RegFrf (0x07, 0x08, 0x09) - Carrier frequency [MHz]
 # 315Mhz band
 RF_FRFMSB_314 = 0x4E
 RF_FRFMID_314 = 0x80
@@ -938,11 +977,11 @@ RF_FRFMID_928 = 0x00
 RF_FRFLSB_928 = 0x00
 
 
-# RegOsc1
-RF_OSC1_RCCAL_START = 0x80
-RF_OSC1_RCCAL_DONE = 0x40
+# RegOsc1 (0x0A)
+RF_OSC1_RCCAL_START = 0x80  # Triggers the calibration of the RC oscillator when set. Always reads 0. RC calibration must be triggered in Standby mode.
+RF_OSC1_RCCAL_DONE  = 0x40  # RC calibration is over
 
-# RegLowBat
+# RegLowBat (0x0C)
 RF_LOWBAT_MONITOR = 0x10
 RF_LOWBAT_ON = 0x08
 RF_LOWBAT_OFF = 0x00  # Default
@@ -957,33 +996,41 @@ RF_LOWBAT_TRIM_2116 = 0x06
 RF_LOWBAT_TRIM_2185 = 0x07
 
 
-# RegListen1
-RF_LISTEN1_RESOL_64 = 0x50
-RF_LISTEN1_RESOL_4100 = 0xA0  # Default
-RF_LISTEN1_RESOL_262000 = 0xF0
+# RegListen1 (0x0D)
+# Resolution of Listen mode Idle time
+RF_LISTEN1_RESOL_64     = 0x50  # 64us
+RF_LISTEN1_RESOL_4100   = 0xA0  # Default: 4.1ms
+RF_LISTEN1_RESOL_262000 = 0xF0  # 262ms
 
-RF_LISTEN1_CRITERIA_RSSI = 0x00  # Default
-RF_LISTEN1_CRITERIA_RSSIANDSYNC = 0x08
+# Criteria for packet acceptance in Listen mode
+RF_LISTEN1_CRITERIA_RSSI        = 0x00  # Default: Signal strength is above RssiThreshold
+RF_LISTEN1_CRITERIA_RSSIANDSYNC = 0x08  # Signal strength is above RssiThreshold and SyncAddress matched
 
-RF_LISTEN1_END_00 = 0x00
-RF_LISTEN1_END_01 = 0x02  # Default
-RF_LISTEN1_END_10 = 0x04
+# Action taken after acceptance of a packet in Listen mode
+RF_LISTEN1_END_00 = 0x00  # Chip stays in Rx mode. Listen mode stops and must be disabled
+RF_LISTEN1_END_01 = 0x02  # Default: Chip stays in Rx mode until PayloadReady or Timeout interrupt occurs. It then goes to the mode defined by Mode. Listen mode stops and must be disabled.
+RF_LISTEN1_END_10 = 0x04  # Chip stays in Rx mode until PayloadReady or Timeout interrupt occurs. Listen mode then resumes in Idle state. FIFO content is lost at next Rx wakeup.
 
 
-# RegListen2
-RF_LISTEN2_COEFIDLE_VALUE = 0xF5 # Default
+# RegListen2 (0x0E)
+RF_LISTEN2_COEFIDLE_VALUE = 0xF5  # Default: Duration of the Idle phase in Listen mode
 
-# RegListen3
-RF_LISTEN3_COEFRX_VALUE = 0x20 # Default
+# RegListen3 (0x0F)
+RF_LISTEN3_COEFRX_VALUE = 0x20 # Default: Duration of the Rx phase in Listen mode
 
-# RegPaLevel
-RF_PALEVEL_PA0_ON = 0x80  # Default
-RF_PALEVEL_PA0_OFF = 0x00
-RF_PALEVEL_PA1_ON = 0x40
-RF_PALEVEL_PA1_OFF = 0x00  # Default
-RF_PALEVEL_PA2_ON = 0x20
-RF_PALEVEL_PA2_OFF = 0x00  # Default
+# RegPaLevel (0x11)
+RF_PALEVEL_PA0_ON  = 0x80  # Default: Enables PA0, connected to RFIO and LNA
+RF_PALEVEL_PA0_OFF = 0x00  # Disables PA0
+RF_PALEVEL_PA1_ON  = 0x40  # Enables PA1, on PA_BOOST pin
+RF_PALEVEL_PA1_OFF = 0x00  # Default: Disables PA1
+RF_PALEVEL_PA2_ON  = 0x20  # Enables PA2, on PA_BOOST pin
+RF_PALEVEL_PA2_OFF = 0x00  # Default: Disables PA2
 
+# Output power setting, with 1dB steps
+# Pout = -18 + OutputPower [dBm], with PA0
+# Pout = -18 + OutputPower [dBm], with PA1
+# Pout = -14 + OutputPower [dBm], with PA1 and PA2
+# Pout = -11 + OutputPower [dBm], with PA1 and PA2, and high power PA settings
 RF_PALEVEL_OUTPUTPOWER_00000 = 0x00
 RF_PALEVEL_OUTPUTPOWER_00001 = 0x01
 RF_PALEVEL_OUTPUTPOWER_00010 = 0x02
@@ -1018,41 +1065,43 @@ RF_PALEVEL_OUTPUTPOWER_11110 = 0x1E
 RF_PALEVEL_OUTPUTPOWER_11111 = 0x1F  # Default
 
 
-# RegPaRamp
-RF_PARAMP_3400 = 0x00
-RF_PARAMP_2000 = 0x01
-RF_PARAMP_1000 = 0x02
-RF_PARAMP_500 = 0x03
-RF_PARAMP_250 = 0x04
-RF_PARAMP_125 = 0x05
-RF_PARAMP_100 = 0x06
-RF_PARAMP_62 = 0x07
-RF_PARAMP_50 = 0x08
-RF_PARAMP_40 = 0x09  # Default
-RF_PARAMP_31 = 0x0A
-RF_PARAMP_25 = 0x0B
-RF_PARAMP_20 = 0x0C
-RF_PARAMP_15 = 0x0D
-RF_PARAMP_12 = 0x0E
-RF_PARAMP_10 = 0x0F
+# RegPaRamp (0x12) - Rise/Fall time of ramp up/down in FSK
+RF_PARAMP_3400 = 0x00  # 3.4 ms
+RF_PARAMP_2000 = 0x01  # 2 ms
+RF_PARAMP_1000 = 0x02  # 1 ms
+RF_PARAMP_500  = 0x03  # 500 us
+RF_PARAMP_250  = 0x04  # 250 us
+RF_PARAMP_125  = 0x05  # 125 us
+RF_PARAMP_100  = 0x06  # 100 us
+RF_PARAMP_62   = 0x07  # 62 us
+RF_PARAMP_50   = 0x08  # 50 us
+RF_PARAMP_40   = 0x09  # Default: 40 us
+RF_PARAMP_31   = 0x0A  # 31 us
+RF_PARAMP_25   = 0x0B  # 25 us
+RF_PARAMP_20   = 0x0C  # 20 us
+RF_PARAMP_15   = 0x0D  # 15 us
+RF_PARAMP_12   = 0x0E  # 12 us
+RF_PARAMP_10   = 0x0F  # 10 us
 
 
-# RegOcp
-RF_OCP_OFF = 0x0F
-RF_OCP_ON = 0x1A  # Default
+# RegOcp (0x13)
+# Overload current protection (OCP) for the PA
+RF_OCP_OFF = 0x0F  # OCP disabled
+RF_OCP_ON  = 0x1A  # Default: OCP enabled
 
-RF_OCP_TRIM_45 = 0x00
-RF_OCP_TRIM_50 = 0x01
-RF_OCP_TRIM_55 = 0x02
-RF_OCP_TRIM_60 = 0x03
-RF_OCP_TRIM_65 = 0x04
-RF_OCP_TRIM_70 = 0x05
-RF_OCP_TRIM_75 = 0x06
-RF_OCP_TRIM_80 = 0x07
-RF_OCP_TRIM_85 = 0x08
-RF_OCP_TRIM_90 = 0x09
-RF_OCP_TRIM_95 = 0x0A
-RF_OCP_TRIM_100 = 0x0B  # Default
+# Trimming of the OCP current
+RF_OCP_TRIM_45  = 0x00
+RF_OCP_TRIM_50  = 0x01
+RF_OCP_TRIM_55  = 0x02
+RF_OCP_TRIM_60  = 0x03
+RF_OCP_TRIM_65  = 0x04
+RF_OCP_TRIM_70  = 0x05
+RF_OCP_TRIM_75  = 0x06
+RF_OCP_TRIM_80  = 0x07
+RF_OCP_TRIM_85  = 0x08
+RF_OCP_TRIM_90  = 0x09
+RF_OCP_TRIM_95  = 0x0A  # Default: 95 mA
+RF_OCP_TRIM_100 = 0x0B
 RF_OCP_TRIM_105 = 0x0C
 RF_OCP_TRIM_110 = 0x0D
 RF_OCP_TRIM_115 = 0x0E
@@ -1060,29 +1109,29 @@ RF_OCP_TRIM_120 = 0x0F
 
 
 # RegAgcRef
-RF_AGCREF_AUTO_ON = 0x40  # Default
+RF_AGCREF_AUTO_ON  = 0x40  # Default
 RF_AGCREF_AUTO_OFF = 0x00
 
-RF_AGCREF_LEVEL_MINUS80 = 0x00  # Default
-RF_AGCREF_LEVEL_MINUS81 = 0x01
-RF_AGCREF_LEVEL_MINUS82 = 0x02
-RF_AGCREF_LEVEL_MINUS83 = 0x03
-RF_AGCREF_LEVEL_MINUS84 = 0x04
-RF_AGCREF_LEVEL_MINUS85 = 0x05
-RF_AGCREF_LEVEL_MINUS86 = 0x06
-RF_AGCREF_LEVEL_MINUS87 = 0x07
-RF_AGCREF_LEVEL_MINUS88 = 0x08
-RF_AGCREF_LEVEL_MINUS89 = 0x09
-RF_AGCREF_LEVEL_MINUS90 = 0x0A
-RF_AGCREF_LEVEL_MINUS91 = 0x0B
-RF_AGCREF_LEVEL_MINUS92 = 0x0C
-RF_AGCREF_LEVEL_MINUS93 = 0x0D
-RF_AGCREF_LEVEL_MINUS94 = 0x0E
-RF_AGCREF_LEVEL_MINUS95 = 0x0F
-RF_AGCREF_LEVEL_MINUS96 = 0x10
-RF_AGCREF_LEVEL_MINUS97 = 0x11
-RF_AGCREF_LEVEL_MINUS98 = 0x12
-RF_AGCREF_LEVEL_MINUS99 = 0x13
+RF_AGCREF_LEVEL_MINUS80  = 0x00  # Default
+RF_AGCREF_LEVEL_MINUS81  = 0x01
+RF_AGCREF_LEVEL_MINUS82  = 0x02
+RF_AGCREF_LEVEL_MINUS83  = 0x03
+RF_AGCREF_LEVEL_MINUS84  = 0x04
+RF_AGCREF_LEVEL_MINUS85  = 0x05
+RF_AGCREF_LEVEL_MINUS86  = 0x06
+RF_AGCREF_LEVEL_MINUS87  = 0x07
+RF_AGCREF_LEVEL_MINUS88  = 0x08
+RF_AGCREF_LEVEL_MINUS89  = 0x09
+RF_AGCREF_LEVEL_MINUS90  = 0x0A
+RF_AGCREF_LEVEL_MINUS91  = 0x0B
+RF_AGCREF_LEVEL_MINUS92  = 0x0C
+RF_AGCREF_LEVEL_MINUS93  = 0x0D
+RF_AGCREF_LEVEL_MINUS94  = 0x0E
+RF_AGCREF_LEVEL_MINUS95  = 0x0F
+RF_AGCREF_LEVEL_MINUS96  = 0x10
+RF_AGCREF_LEVEL_MINUS97  = 0x11
+RF_AGCREF_LEVEL_MINUS98  = 0x12
+RF_AGCREF_LEVEL_MINUS99  = 0x13
 RF_AGCREF_LEVEL_MINUS100 = 0x14
 RF_AGCREF_LEVEL_MINUS101 = 0x15
 RF_AGCREF_LEVEL_MINUS102 = 0x16
@@ -1139,16 +1188,16 @@ RF_AGCTHRESH1_SNRMARGIN_101 = 0xA0  # Default
 RF_AGCTHRESH1_SNRMARGIN_110 = 0xC0
 RF_AGCTHRESH1_SNRMARGIN_111 = 0xE0
 
-RF_AGCTHRESH1_STEP1_0 = 0x00
-RF_AGCTHRESH1_STEP1_1 = 0x01
-RF_AGCTHRESH1_STEP1_2 = 0x02
-RF_AGCTHRESH1_STEP1_3 = 0x03
-RF_AGCTHRESH1_STEP1_4 = 0x04
-RF_AGCTHRESH1_STEP1_5 = 0x05
-RF_AGCTHRESH1_STEP1_6 = 0x06
-RF_AGCTHRESH1_STEP1_7 = 0x07
-RF_AGCTHRESH1_STEP1_8 = 0x08
-RF_AGCTHRESH1_STEP1_9 = 0x09
+RF_AGCTHRESH1_STEP1_0  = 0x00
+RF_AGCTHRESH1_STEP1_1  = 0x01
+RF_AGCTHRESH1_STEP1_2  = 0x02
+RF_AGCTHRESH1_STEP1_3  = 0x03
+RF_AGCTHRESH1_STEP1_4  = 0x04
+RF_AGCTHRESH1_STEP1_5  = 0x05
+RF_AGCTHRESH1_STEP1_6  = 0x06
+RF_AGCTHRESH1_STEP1_7  = 0x07
+RF_AGCTHRESH1_STEP1_8  = 0x08
+RF_AGCTHRESH1_STEP1_9  = 0x09
 RF_AGCTHRESH1_STEP1_10 = 0x0A
 RF_AGCTHRESH1_STEP1_11 = 0x0B
 RF_AGCTHRESH1_STEP1_12 = 0x0C
@@ -1174,16 +1223,16 @@ RF_AGCTHRESH1_STEP1_31 = 0x1F
 
 
 # RegAgcThresh2
-RF_AGCTHRESH2_STEP2_0 = 0x00
-RF_AGCTHRESH2_STEP2_1 = 0x10
-RF_AGCTHRESH2_STEP2_2 = 0x20
-RF_AGCTHRESH2_STEP2_3 = 0x30  # XXX wrong -- Default
-RF_AGCTHRESH2_STEP2_4 = 0x40
-RF_AGCTHRESH2_STEP2_5 = 0x50
-RF_AGCTHRESH2_STEP2_6 = 0x60
-RF_AGCTHRESH2_STEP2_7 = 0x70	# default
-RF_AGCTHRESH2_STEP2_8 = 0x80
-RF_AGCTHRESH2_STEP2_9 = 0x90
+RF_AGCTHRESH2_STEP2_0  = 0x00
+RF_AGCTHRESH2_STEP2_1  = 0x10
+RF_AGCTHRESH2_STEP2_2  = 0x20
+RF_AGCTHRESH2_STEP2_3  = 0x30  # XXX wrong -- Default
+RF_AGCTHRESH2_STEP2_4  = 0x40
+RF_AGCTHRESH2_STEP2_5  = 0x50
+RF_AGCTHRESH2_STEP2_6  = 0x60
+RF_AGCTHRESH2_STEP2_7  = 0x70	# default
+RF_AGCTHRESH2_STEP2_8  = 0x80
+RF_AGCTHRESH2_STEP2_9  = 0x90
 RF_AGCTHRESH2_STEP2_10 = 0xA0
 RF_AGCTHRESH2_STEP2_11 = 0xB0
 RF_AGCTHRESH2_STEP2_12 = 0xC0
@@ -1191,16 +1240,16 @@ RF_AGCTHRESH2_STEP2_13 = 0xD0
 RF_AGCTHRESH2_STEP2_14 = 0xE0
 RF_AGCTHRESH2_STEP2_15 = 0xF0
 
-RF_AGCTHRESH2_STEP3_0 = 0x00
-RF_AGCTHRESH2_STEP3_1 = 0x01
-RF_AGCTHRESH2_STEP3_2 = 0x02
-RF_AGCTHRESH2_STEP3_3 = 0x03
-RF_AGCTHRESH2_STEP3_4 = 0x04
-RF_AGCTHRESH2_STEP3_5 = 0x05
-RF_AGCTHRESH2_STEP3_6 = 0x06
-RF_AGCTHRESH2_STEP3_7 = 0x07
-RF_AGCTHRESH2_STEP3_8 = 0x08
-RF_AGCTHRESH2_STEP3_9 = 0x09
+RF_AGCTHRESH2_STEP3_0  = 0x00
+RF_AGCTHRESH2_STEP3_1  = 0x01
+RF_AGCTHRESH2_STEP3_2  = 0x02
+RF_AGCTHRESH2_STEP3_3  = 0x03
+RF_AGCTHRESH2_STEP3_4  = 0x04
+RF_AGCTHRESH2_STEP3_5  = 0x05
+RF_AGCTHRESH2_STEP3_6  = 0x06
+RF_AGCTHRESH2_STEP3_7  = 0x07
+RF_AGCTHRESH2_STEP3_8  = 0x08
+RF_AGCTHRESH2_STEP3_9  = 0x09
 RF_AGCTHRESH2_STEP3_10 = 0x0A
 RF_AGCTHRESH2_STEP3_11 = 0x0B  # Default
 RF_AGCTHRESH2_STEP3_12 = 0x0C
@@ -1210,16 +1259,16 @@ RF_AGCTHRESH2_STEP3_15 = 0x0F
 
 
 # RegAgcThresh3
-RF_AGCTHRESH3_STEP4_0 = 0x00
-RF_AGCTHRESH3_STEP4_1 = 0x10
-RF_AGCTHRESH3_STEP4_2 = 0x20
-RF_AGCTHRESH3_STEP4_3 = 0x30
-RF_AGCTHRESH3_STEP4_4 = 0x40
-RF_AGCTHRESH3_STEP4_5 = 0x50
-RF_AGCTHRESH3_STEP4_6 = 0x60
-RF_AGCTHRESH3_STEP4_7 = 0x70
-RF_AGCTHRESH3_STEP4_8 = 0x80
-RF_AGCTHRESH3_STEP4_9 = 0x90  # Default
+RF_AGCTHRESH3_STEP4_0  = 0x00
+RF_AGCTHRESH3_STEP4_1  = 0x10
+RF_AGCTHRESH3_STEP4_2  = 0x20
+RF_AGCTHRESH3_STEP4_3  = 0x30
+RF_AGCTHRESH3_STEP4_4  = 0x40
+RF_AGCTHRESH3_STEP4_5  = 0x50
+RF_AGCTHRESH3_STEP4_6  = 0x60
+RF_AGCTHRESH3_STEP4_7  = 0x70
+RF_AGCTHRESH3_STEP4_8  = 0x80
+RF_AGCTHRESH3_STEP4_9  = 0x90  # Default
 RF_AGCTHRESH3_STEP4_10 = 0xA0
 RF_AGCTHRESH3_STEP4_11 = 0xB0
 RF_AGCTHRESH3_STEP4_12 = 0xC0
@@ -1227,16 +1276,16 @@ RF_AGCTHRESH3_STEP4_13 = 0xD0
 RF_AGCTHRESH3_STEP4_14 = 0xE0
 RF_AGCTHRESH3_STEP4_15 = 0xF0
 
-RF_AGCTHRESH3_STEP5_0 = 0x00
-RF_AGCTHRESH3_STEP5_1 = 0x01
-RF_AGCTHRESH3_STEP5_2 = 0x02
-RF_AGCTHRESH3_STEP5_3 = 0x03
-RF_AGCTHRESH3_STEP5_4 = 0x04
-RF_AGCTHRESH3_STEP5_5 = 0x05
-RF_AGCTHRESH3_STEP5_6 = 0x06
-RF_AGCTHRESH3_STEP5_7 = 0x07
-RF_AGCTHRES33_STEP5_8 = 0x08
-RF_AGCTHRESH3_STEP5_9 = 0x09
+RF_AGCTHRESH3_STEP5_0  = 0x00
+RF_AGCTHRESH3_STEP5_1  = 0x01
+RF_AGCTHRESH3_STEP5_2  = 0x02
+RF_AGCTHRESH3_STEP5_3  = 0x03
+RF_AGCTHRESH3_STEP5_4  = 0x04
+RF_AGCTHRESH3_STEP5_5  = 0x05
+RF_AGCTHRESH3_STEP5_6  = 0x06
+RF_AGCTHRESH3_STEP5_7  = 0x07
+RF_AGCTHRES33_STEP5_8  = 0x08
+RF_AGCTHRESH3_STEP5_9  = 0x09
 RF_AGCTHRESH3_STEP5_10 = 0x0A
 RF_AGCTHRESH3_STEP5_11 = 0x0B  # Default
 RF_AGCTHRESH3_STEP5_12 = 0x0C
@@ -1245,25 +1294,27 @@ RF_AGCTHRESH3_STEP5_14 = 0x0E
 RF_AGCTHRESH3_STEP5_15 = 0x0F
 
 
-# RegLna
-RF_LNA_ZIN_50 = 0x00
-RF_LNA_ZIN_200 = 0x80  # Default
+# RegLna (0x18)
+# LNA's input impedance
+RF_LNA_ZIN_50  = 0x00  # 50 ohms
+RF_LNA_ZIN_200 = 0x80  # Default: 200 ohms
 
 RF_LNA_LOWPOWER_OFF = 0x00  # Default
-RF_LNA_LOWPOWER_ON = 0x40
+RF_LNA_LOWPOWER_ON  = 0x40
 
 RF_LNA_CURRENTGAIN = 0x08
 
-RF_LNA_GAINSELECT_AUTO = 0x00  # Default
-RF_LNA_GAINSELECT_MAX = 0x01
-RF_LNA_GAINSELECT_MAXMINUS6 = 0x02
-RF_LNA_GAINSELECT_MAXMINUS12 = 0x03
-RF_LNA_GAINSELECT_MAXMINUS24 = 0x04
-RF_LNA_GAINSELECT_MAXMINUS36 = 0x05
-RF_LNA_GAINSELECT_MAXMINUS48 = 0x06
+RF_LNA_GAINSELECT_AUTO       = 0x00  # Default: Gain set by the internal AGC loop
+RF_LNA_GAINSELECT_MAX        = 0x01  # G1 = highest gain
+RF_LNA_GAINSELECT_MAXMINUS6  = 0x02  # G2 = highest gain - 6 dB
+RF_LNA_GAINSELECT_MAXMINUS12 = 0x03  # G3 = highest gain - 12 dB
+RF_LNA_GAINSELECT_MAXMINUS24 = 0x04  # G4 = highest gain - 24 dB
+RF_LNA_GAINSELECT_MAXMINUS36 = 0x05  # G5 = highest gain - 36 dB
+RF_LNA_GAINSELECT_MAXMINUS48 = 0x06  # G6 = highest gain - 48 dB
 
 
-# RegRxBw
+# RegRxBw (0x19)
+# Cut-off frequency of the DC offset canceller
 RF_RXBW_DCCFREQ_000 = 0x00
 RF_RXBW_DCCFREQ_001 = 0x20
 RF_RXBW_DCCFREQ_010 = 0x40  # Default
@@ -1273,10 +1324,12 @@ RF_RXBW_DCCFREQ_101 = 0xA0
 RF_RXBW_DCCFREQ_110 = 0xC0
 RF_RXBW_DCCFREQ_111 = 0xE0
 
+# Channel filter bandwidth control
 RF_RXBW_MANT_16 = 0x00
 RF_RXBW_MANT_20 = 0x08
 RF_RXBW_MANT_24 = 0x10  # Default
 
+# Channel filter bandwidth control
 RF_RXBW_EXP_0 = 0x00
 RF_RXBW_EXP_1 = 0x01
 RF_RXBW_EXP_2 = 0x02
@@ -1287,7 +1340,8 @@ RF_RXBW_EXP_6 = 0x06
 RF_RXBW_EXP_7 = 0x07
 
 
-# RegAfcBw
+# RegAfcBw (0x1A)
+# DccFreq parameter used during the AFC
 RF_AFCBW_DCCFREQAFC_000 = 0x00
 RF_AFCBW_DCCFREQAFC_001 = 0x20
 RF_AFCBW_DCCFREQAFC_010 = 0x40
@@ -1297,10 +1351,12 @@ RF_AFCBW_DCCFREQAFC_101 = 0xA0
 RF_AFCBW_DCCFREQAFC_110 = 0xC0
 RF_AFCBW_DCCFREQAFC_111 = 0xE0
 
+# RxBwMant parameter used during the AFC
 RF_AFCBW_MANTAFC_16 = 0x00
 RF_AFCBW_MANTAFC_20 = 0x08  # Default
 RF_AFCBW_MANTAFC_24 = 0x10
 
+# RxBwExp parameter used during the AFC
 RF_AFCBW_EXPAFC_0 = 0x00
 RF_AFCBW_EXPAFC_1 = 0x01
 RF_AFCBW_EXPAFC_2 = 0x02
@@ -1311,62 +1367,67 @@ RF_AFCBW_EXPAFC_6 = 0x06
 RF_AFCBW_EXPAFC_7 = 0x07
 
 
-# RegOokPeak
-RF_OOKPEAK_THRESHTYPE_FIXED = 0x00
-RF_OOKPEAK_THRESHTYPE_PEAK = 0x40  # Default
+# RegOokPeak (0x1B)
+# Selects type of threshold in the OOK data slicer
+RF_OOKPEAK_THRESHTYPE_FIXED   = 0x00
+RF_OOKPEAK_THRESHTYPE_PEAK    = 0x40  # Default
 RF_OOKPEAK_THRESHTYPE_AVERAGE = 0x80
 
-RF_OOKPEAK_PEAKTHRESHSTEP_000 = 0x00  # Default
-RF_OOKPEAK_PEAKTHRESHSTEP_001 = 0x08
-RF_OOKPEAK_PEAKTHRESHSTEP_010 = 0x10
-RF_OOKPEAK_PEAKTHRESHSTEP_011 = 0x18
-RF_OOKPEAK_PEAKTHRESHSTEP_100 = 0x20
-RF_OOKPEAK_PEAKTHRESHSTEP_101 = 0x28
-RF_OOKPEAK_PEAKTHRESHSTEP_110 = 0x30
-RF_OOKPEAK_PEAKTHRESHSTEP_111 = 0x38
+# Size of each decrement of the RSSI threshold in the OOK demodulator
+RF_OOKPEAK_PEAKTHRESHSTEP_000 = 0x00  # Default: 0.5 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_001 = 0x08  # 1.0 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_010 = 0x10  # 1.5 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_011 = 0x18  # 2.0 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_100 = 0x20  # 3.0 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_101 = 0x28  # 4.0 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_110 = 0x30  # 5.0 dB
+RF_OOKPEAK_PEAKTHRESHSTEP_111 = 0x38  # 6.0 dB
 
-RF_OOKPEAK_PEAKTHRESHDEC_000 = 0x00  # Default
-RF_OOKPEAK_PEAKTHRESHDEC_001 = 0x01
-RF_OOKPEAK_PEAKTHRESHDEC_010 = 0x02
-RF_OOKPEAK_PEAKTHRESHDEC_011 = 0x03
-RF_OOKPEAK_PEAKTHRESHDEC_100 = 0x04
-RF_OOKPEAK_PEAKTHRESHDEC_101 = 0x05
-RF_OOKPEAK_PEAKTHRESHDEC_110 = 0x06
-RF_OOKPEAK_PEAKTHRESHDEC_111 = 0x07
-
-
-# RegOokAvg
-RF_OOKAVG_AVERAGETHRESHFILT_00 = 0x00
-RF_OOKAVG_AVERAGETHRESHFILT_01 = 0x40
-RF_OOKAVG_AVERAGETHRESHFILT_10 = 0x80  # Default
-RF_OOKAVG_AVERAGETHRESHFILT_11 = 0xC0
+# Period of decrement of the RSSI threshold in the OOK demodulator
+RF_OOKPEAK_PEAKTHRESHDEC_000 = 0x00  # Default: Once per chip
+RF_OOKPEAK_PEAKTHRESHDEC_001 = 0x01  # Once every 2 chips
+RF_OOKPEAK_PEAKTHRESHDEC_010 = 0x02  # Once every 4 chips
+RF_OOKPEAK_PEAKTHRESHDEC_011 = 0x03  # Once every 8 chips
+RF_OOKPEAK_PEAKTHRESHDEC_100 = 0x04  # Twice in each chip
+RF_OOKPEAK_PEAKTHRESHDEC_101 = 0x05  # 4 times in each chip
+RF_OOKPEAK_PEAKTHRESHDEC_110 = 0x06  # 8 times in each chip
+RF_OOKPEAK_PEAKTHRESHDEC_111 = 0x07  # 16 times in each chip
 
 
-# RegOokFix
-RF_OOKFIX_FIXEDTHRESH_VALUE = 0x06  # Default
+# RegOokAvg (0x1C)
+# Filter coefficients in average mode of the OOK demodulator
+RF_OOKAVG_AVERAGETHRESHFILT_00 = 0x00  # f_C = chip rate / 32.pi
+RF_OOKAVG_AVERAGETHRESHFILT_01 = 0x40  # f_C = chip rate / 8.pi
+RF_OOKAVG_AVERAGETHRESHFILT_10 = 0x80  # Default: f_C = chip rate / 4.pi
+RF_OOKAVG_AVERAGETHRESHFILT_11 = 0xC0  # f_C = chip rate / 2.pi
 
 
-# RegAfcFei
-RF_AFCFEI_FEI_DONE = 0x40
-RF_AFCFEI_FEI_START = 0x20
-RF_AFCFEI_AFC_DONE = 0x10
-RF_AFCFEI_AFCAUTOCLEAR_ON = 0x08
-RF_AFCFEI_AFCAUTOCLEAR_OFF = 0x00  # Default
+# RegOokFix (0x1D)
+# Fixed threshold value in the OOK demodulator [dB]. Used when OokThresType = 00
+RF_OOKFIX_FIXEDTHRESH_VALUE = 0x06  # Default: 6 dB
 
-RF_AFCFEI_AFCAUTO_ON = 0x04
-RF_AFCFEI_AFCAUTO_OFF = 0x00  # Default
 
-RF_AFCFEI_AFC_CLEAR = 0x02
-RF_AFCFEI_AFC_START = 0x01
+# RegAfcFei (0x1E)
+RF_AFCFEI_FEI_DONE         = 0x40  # FEI is on-going
+RF_AFCFEI_FEI_START        = 0x20  # Triggers a FEI measurement when set. Always reads 0.
+RF_AFCFEI_AFC_DONE         = 0x10  # AFC is on-going
+RF_AFCFEI_AFCAUTOCLEAR_ON  = 0x08  # AFC register is cleared before a new AFC phase (only valid if AfcAutoOn is set)
+RF_AFCFEI_AFCAUTOCLEAR_OFF = 0x00  # Default: AFC register is not cleared before a new AFC phase
 
-# RegRssiConfig
-RF_RSSI_FASTRX_ON = 0x08
+RF_AFCFEI_AFCAUTO_ON  = 0x04  # AFC is performed each time Rx mode is entered
+RF_AFCFEI_AFCAUTO_OFF = 0x00  # Default: AFC is performed each time AfcStart is set
+
+RF_AFCFEI_AFC_CLEAR = 0x02  # Clears the AfcValue if set in Rx mode. Always reads 0.
+RF_AFCFEI_AFC_START = 0x01  # Triggers an AFC when set. Always reads 0.
+
+# RegRssiConfig (0x23)
+RF_RSSI_FASTRX_ON  = 0x08
 RF_RSSI_FASTRX_OFF = 0x00  # Default
-RF_RSSI_DONE = 0x02
-RF_RSSI_START = 0x01
+RF_RSSI_DONE  = 0x02  # False: RSSI is on-going; True: RSSI sampling is finished, result available
+RF_RSSI_START = 0x01  # Trigger a RSSI measurement when set. Always reads 0
 
 
-# RegDioMapping1
+# RegDioMapping1 (0x25) - Mapping of pins DIO0 to DIO3
 RF_DIOMAPPING1_DIO0_00 = 0x00  # Default
 RF_DIOMAPPING1_DIO0_01 = 0x40
 RF_DIOMAPPING1_DIO0_10 = 0x80
@@ -1388,7 +1449,8 @@ RF_DIOMAPPING1_DIO3_10 = 0x02
 RF_DIOMAPPING1_DIO3_11 = 0x03
 
 
-# RegDioMapping2
+# RegDioMapping2 (0x26)
+# Mapping of pins DIO4 to DIO5
 RF_DIOMAPPING2_DIO4_00 = 0x00  # Default
 RF_DIOMAPPING2_DIO4_01 = 0x40
 RF_DIOMAPPING2_DIO4_10 = 0x80
@@ -1399,57 +1461,61 @@ RF_DIOMAPPING2_DIO5_01 = 0x10
 RF_DIOMAPPING2_DIO5_10 = 0x20
 RF_DIOMAPPING2_DIO5_11 = 0x30
 
-RF_DIOMAPPING2_CLKOUT_32 = 0x00
-RF_DIOMAPPING2_CLKOUT_16 = 0x01
-RF_DIOMAPPING2_CLKOUT_8 = 0x02
-RF_DIOMAPPING2_CLKOUT_4 = 0x03
-RF_DIOMAPPING2_CLKOUT_2 = 0x04
-RF_DIOMAPPING2_CLKOUT_1 = 0x05
-RF_DIOMAPPING2_CLKOUT_RC = 0x06
+# Selects CLKOUT frequency
+RF_DIOMAPPING2_CLKOUT_32  = 0x00  # FXOSC
+RF_DIOMAPPING2_CLKOUT_16  = 0x01  # FXOSC / 2
+RF_DIOMAPPING2_CLKOUT_8   = 0x02  # FXOSC / 4
+RF_DIOMAPPING2_CLKOUT_4   = 0x03  # FXOSC / 8
+RF_DIOMAPPING2_CLKOUT_2   = 0x04  # FXOSC / 16
+RF_DIOMAPPING2_CLKOUT_1   = 0x05  # FXOSC / 32
+RF_DIOMAPPING2_CLKOUT_RC  = 0x06  # RC (automatically enabled)
 RF_DIOMAPPING2_CLKOUT_OFF = 0x07  # Default
 
 
-# RegIrqFlags1
-RF_IRQFLAGS1_MODEREADY = 0x80
-RF_IRQFLAGS1_RXREADY = 0x40
-RF_IRQFLAGS1_TXREADY = 0x20
-RF_IRQFLAGS1_PLLLOCK = 0x10
-RF_IRQFLAGS1_RSSI = 0x08
-RF_IRQFLAGS1_TIMEOUT = 0x04
-RF_IRQFLAGS1_AUTOMODE = 0x02
-RF_IRQFLAGS1_SYNCADDRESSMATCH = 0x01
+# RegIrqFlags1 (0x27)
+RF_IRQFLAGS1_MODEREADY        = 0x80  # Set when the operation mode is ready {Sleep: Entering Sleep mode, Standby: XO is running, FS: PLL is locked, Rx: RSSI sampling starts, Tx: PA ramp-up completed}
+RF_IRQFLAGS1_RXREADY          = 0x40  # Set in Rx mode, after RSSI, AGC and AFC. Cleared when leaving Rx.
+RF_IRQFLAGS1_TXREADY          = 0x20  # Set in Tx mode, after PA ramp-up. Cleared when leaving Tx.
+RF_IRQFLAGS1_PLLLOCK          = 0x10  # Set (in FS, RX, or TX) when the PLL is locked. Cleared when it is not.
+RF_IRQFLAGS1_RSSI             = 0x08  # Set in Rx when the RssiValue exceeds RssiThreshold. Cleared when leaving Rx.
+RF_IRQFLAGS1_TIMEOUT          = 0x04  # Set when a timeout occurs. Cleared when leaving Rx or FIFO is emptied.
+RF_IRQFLAGS1_AUTOMODE         = 0x02  # Set when entering Intermediate mode. Cleared when exiting Intermediate mode.
+RF_IRQFLAGS1_SYNCADDRESSMATCH = 0x01  # Set when Sync and Address (if enabled) are detected. Cleared when leaving Rx or FIFO is emptied.
 
-# RegIrqFlags2
-RF_IRQFLAGS2_FIFOFULL = 0x80
-RF_IRQFLAGS2_FIFONOTEMPTY = 0x40
-RF_IRQFLAGS2_FIFOLEVEL = 0x20
-RF_IRQFLAGS2_FIFOOVERRUN = 0x10
-RF_IRQFLAGS2_PACKETSENT = 0x08
-RF_IRQFLAGS2_PAYLOADREADY = 0x04
-RF_IRQFLAGS2_CRCOK = 0x02
-RF_IRQFLAGS2_LOWBAT = 0x01
+# RegIrqFlags2 (0x28)
+RF_IRQFLAGS2_FIFOFULL     = 0x80  # Set when FIFO is full (contains 66 bytes), else cleared.
+RF_IRQFLAGS2_FIFONOTEMPTY = 0x40  # Set when FIFo contains at least one byte, else cleared.
+RF_IRQFLAGS2_FIFOLEVEL    = 0x20  # Set when the number of bytes in the FIFO strictly exceeds FifoThreshold, else cleared.
+RF_IRQFLAGS2_FIFOOVERRUN  = 0x10  # Set when FIFO overrun occurs (except in Sleep mode). Flags and FIFO are cleared when this bit is set.
+RF_IRQFLAGS2_PACKETSENT   = 0x08  # Set in Tx when the complete packet has been setn. Cleared when exiting Tx.
+RF_IRQFLAGS2_PAYLOADREADY = 0x04  # Set in Rx when the payload is ready. Cleared when FIFO is empty.
+RF_IRQFLAGS2_CRCOK        = 0x02  # Set in Rx when the CRC of the payload is Ok. Cleared when FIFO is empty.
+RF_IRQFLAGS2_LOWBAT       = 0x01
 
-# RegRssiThresh
+# RegRssiThresh (0x29) - RSSI trigger level for Rssi interrupt - RssiThreshold / 2 [dBm]
 RF_RSSITHRESH_VALUE = 0xE4  # Default
 
-# RegRxTimeout1
+# RegRxTimeout1 (0x2A) - Timeout interrupt TimeoutRxStart*16*T_bit after switching to Rx mode if Rssi interrupt doesn't occur
 RF_RXTIMEOUT1_RXSTART_VALUE = 0x00  # Default
 
-# RegRxTimeout2
+# RegRxTimeout2 (0x2B) - Timeout interrupt is generated TimeoutRssiThresh*16*T_bit after Rssi interrupt if PayloadReady interrupt doesn't occur
 RF_RXTIMEOUT2_RSSITHRESH_VALUE = 0x00  # Default
 
-# RegPreamble
+# RegPreamble (0x2C, 0x2D) - Size of the preamble to be sent
 RF_PREAMBLESIZE_MSB_VALUE = 0x00  # Default
 RF_PREAMBLESIZE_LSB_VALUE = 0x03  # Default
 
 
-# RegSyncConfig
-RF_SYNC_ON = 0x80  # Default
+# RegSyncConfig (0x2E)
+# Enables the Sync word generation and detection
+RF_SYNC_ON  = 0x80  # Default
 RF_SYNC_OFF = 0x00
 
-RF_SYNC_FIFOFILL_AUTO = 0x00  # Default -- when sync interrupt occurs
-RF_SYNC_FIFOFILL_MANUAL = 0x40
+# FIFO filling condition
+RF_SYNC_FIFOFILL_AUTO   = 0x00  # Default: If SyncAddress interrupt occurs
+RF_SYNC_FIFOFILL_MANUAL = 0x40  # as long as FifoFillCondition is set
 
+# Size of the Sync word: (SyncSize + 1) bytes
 RF_SYNC_SIZE_1 = 0x00
 RF_SYNC_SIZE_2 = 0x08
 RF_SYNC_SIZE_3 = 0x10
@@ -1459,6 +1525,7 @@ RF_SYNC_SIZE_6 = 0x28
 RF_SYNC_SIZE_7 = 0x30
 RF_SYNC_SIZE_8 = 0x38
 
+# Number of tolerated bit errors in Sync word
 RF_SYNC_TOL_0 = 0x00  # Default
 RF_SYNC_TOL_1 = 0x01
 RF_SYNC_TOL_2 = 0x02
@@ -1469,7 +1536,7 @@ RF_SYNC_TOL_6 = 0x06
 RF_SYNC_TOL_7 = 0x07
 
 
-# RegSyncValue1-8
+# RegSyncValue[1-8] (0x2F-0x36) - Used if SyncOn is set
 RF_SYNC_BYTE1_VALUE = 0x00  # Default
 RF_SYNC_BYTE2_VALUE = 0x00  # Default
 RF_SYNC_BYTE3_VALUE = 0x00  # Default
@@ -1480,97 +1547,111 @@ RF_SYNC_BYTE7_VALUE = 0x00  # Default
 RF_SYNC_BYTE8_VALUE = 0x00  # Default
 
 
-# RegPacketConfig1
-RF_PACKET1_FORMAT_FIXED = 0x00  # Default
+# RegPacketConfig1 (0x37)
+# Defines the packet format used
+RF_PACKET1_FORMAT_FIXED    = 0x00  # Default
 RF_PACKET1_FORMAT_VARIABLE = 0x80
 
-RF_PACKET1_DCFREE_OFF = 0x00  # Default
-RF_PACKET1_DCFREE_MANCHESTER = 0x20
-RF_PACKET1_DCFREE_WHITENING = 0x40
+# Defines DC-free encoding/decoding performed
+RF_PACKET1_DCFREE_OFF        = 0x00  # Default: None (Off)
+RF_PACKET1_DCFREE_MANCHESTER = 0x20  # Manchester
+RF_PACKET1_DCFREE_WHITENING  = 0x40  # Whitening
 
-RF_PACKET1_CRC_ON = 0x10  # Default
-RF_PACKET1_CRC_OFF = 0x00
+# Enables CRC calculation/check (Tx/Rx)
+RF_PACKET1_CRC_ON  = 0x10  # Default: On
+RF_PACKET1_CRC_OFF = 0x00  # Off
 
-RF_PACKET1_CRCAUTOCLEAR_ON = 0x00  # Default
-RF_PACKET1_CRCAUTOCLEAR_OFF = 0x08
+# Defines the behavior of the packet handler when CRC check fails
+RF_PACKET1_CRCAUTOCLEAR_ON  = 0x00  # Default: Clear FIFO and restart new packet reception. No PayloadReady interrupt issued.
+RF_PACKET1_CRCAUTOCLEAR_OFF = 0x08  # Do not clear FIFO. PayloadReady interrupt issued.
 
-RF_PACKET1_ADRSFILTERING_OFF = 0x00  # Default
-RF_PACKET1_ADRSFILTERING_NODE = 0x02
-RF_PACKET1_ADRSFILTERING_NODEBROADCAST = 0x04
+# Defines address based filtering in Rx
+RF_PACKET1_ADRSFILTERING_OFF  = 0x00  # Default: None (Off)
+RF_PACKET1_ADRSFILTERING_NODE = 0x02  # Address field must match NodeAddress
+RF_PACKET1_ADRSFILTERING_NODEBROADCAST = 0x04  # Address field must match NodeAddress or BroadcastAddress
 
 
-# RegPayloadLength
+# RegPayloadLength (0x38) - Fixed PacketFormat: Payload length, Variable # PacketFormat: Max length in Rx
 RF_PAYLOADLENGTH_VALUE = 0x40  # Default
 
-# RegBroadcastAdrs
-RF_BROADCASTADDRESS_VALUE = 0x00
+# RegBroadcastAdrs (0x3A) - Broadcast address used in address filtering
+RF_BROADCASTADDRESS_VALUE = 0x00: # Default
 
 
-# RegAutoModes
-RF_AUTOMODES_ENTER_OFF = 0x00  # Default
-RF_AUTOMODES_ENTER_FIFONOTEMPTY = 0x20
-RF_AUTOMODES_ENTER_FIFOLEVEL = 0x40
-RF_AUTOMODES_ENTER_CRCOK = 0x60
-RF_AUTOMODES_ENTER_PAYLOADREADY = 0x80
-RF_AUTOMODES_ENTER_SYNCADRSMATCH = 0xA0
-RF_AUTOMODES_ENTER_PACKETSENT = 0xC0
-RF_AUTOMODES_ENTER_FIFOEMPTY = 0xE0
+# RegAutoModes (0x3B)
+# Interrupt condition for entering the intermediate mode
+RF_AUTOMODES_ENTER_OFF           = 0x00  # Default: None (AutoModes Off)
+RF_AUTOMODES_ENTER_FIFONOTEMPTY  = 0x20  # Rising edge of FifoNotEmpty
+RF_AUTOMODES_ENTER_FIFOLEVEL     = 0x40  # Rising edge of FifoLevel
+RF_AUTOMODES_ENTER_CRCOK         = 0x60  # Rising edge of CrcOk
+RF_AUTOMODES_ENTER_PAYLOADREADY  = 0x80  # Rising edge of PayloadReady
+RF_AUTOMODES_ENTER_SYNCADRSMATCH = 0xA0  # Rising edge of SyncAddress
+RF_AUTOMODES_ENTER_PACKETSENT    = 0xC0  # Rising edge of PacketSent
+RF_AUTOMODES_ENTER_FIFOEMPTY     = 0xE0  # Falling edge of FifoNotEmpty
 
-RF_AUTOMODES_EXIT_OFF = 0x00  # Default
-RF_AUTOMODES_EXIT_FIFOEMPTY = 0x04
-RF_AUTOMODES_EXIT_FIFOLEVEL = 0x08
-RF_AUTOMODES_EXIT_CRCOK = 0x0C
-RF_AUTOMODES_EXIT_PAYLOADREADY = 0x10
-RF_AUTOMODES_EXIT_SYNCADRSMATCH = 0x14
-RF_AUTOMODES_EXIT_PACKETSENT = 0x18
-RF_AUTOMODES_EXIT_RXTIMEOUT = 0x1C
+# Interrupt condition for exiting the intermediate mode
+RF_AUTOMODES_EXIT_OFF           = 0x00  # Default: None (AutoModes Off)
+RF_AUTOMODES_EXIT_FIFOEMPTY     = 0x04  # Falling edge of FifoNotEmpty
+RF_AUTOMODES_EXIT_FIFOLEVEL     = 0x08  # Rising edge of FifoLevel or Timeout
+RF_AUTOMODES_EXIT_CRCOK         = 0x0C  # Rising edge of CrcOk or Timeout
+RF_AUTOMODES_EXIT_PAYLOADREADY  = 0x10  # Rising edge of PayloadReady or Timeout
+RF_AUTOMODES_EXIT_SYNCADRSMATCH = 0x14  # Rising edge of SyncAddress or Timeout
+RF_AUTOMODES_EXIT_PACKETSENT    = 0x18  # Rising edge of PacketSent
+RF_AUTOMODES_EXIT_RXTIMEOUT     = 0x1C  # Rising edge of Timeout
 
-RF_AUTOMODES_INTERMEDIATE_SLEEP = 0x00  # Default
-RF_AUTOMODES_INTERMEDIATE_STANDBY = 0x01
-RF_AUTOMODES_INTERMEDIATE_RECEIVER = 0x02
-RF_AUTOMODES_INTERMEDIATE_TRANSMITTER = 0x03
+# Intermediate mode
+RF_AUTOMODES_INTERMEDIATE_SLEEP       = 0x00  # Default: Sleep mode (SLEEP)
+RF_AUTOMODES_INTERMEDIATE_STANDBY     = 0x01  # Standby mode (STDBY)
+RF_AUTOMODES_INTERMEDIATE_RECEIVER    = 0x02  # Receiver mode (RX)
+RF_AUTOMODES_INTERMEDIATE_TRANSMITTER = 0x03  # Transmitter mode (TX)
 
 
-# RegFifoThresh
-RF_FIFOTHRESH_TXSTART_FIFOTHRESH = 0x00
-RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY = 0x80  # Default
+# RegFifoThresh (0x3C)
+# Defines the condition to start packet transmission
+RF_FIFOTHRESH_TXSTART_FIFOTHRESH   = 0x00  # FifoLevel (i.e. the number of bytes in the FIFO exceeds FifoThreshold)
+RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY = 0x80  # Default: FifoNotEmpty (i.e. at least one byte in the FIFO)
 
+# Used to trigger FifoLevel interrupt
 RF_FIFOTHRESH_VALUE = 0x0F  # Default
 
 
-# RegPacketConfig2
-RF_PACKET2_RXRESTARTDELAY_1BIT = 0x00  # Default
-RF_PACKET2_RXRESTARTDELAY_2BITS = 0x10
-RF_PACKET2_RXRESTARTDELAY_4BITS = 0x20
-RF_PACKET2_RXRESTARTDELAY_8BITS = 0x30
-RF_PACKET2_RXRESTARTDELAY_16BITS = 0x40
-RF_PACKET2_RXRESTARTDELAY_32BITS = 0x50
-RF_PACKET2_RXRESTARTDELAY_64BITS = 0x60
-RF_PACKET2_RXRESTARTDELAY_128BITS = 0x70
-RF_PACKET2_RXRESTARTDELAY_256BITS = 0x80
-RF_PACKET2_RXRESTARTDELAY_512BITS = 0x90
+# RegPacketConfig2 (0x3D)
+# After PayloadReady occured, defines the delay between FIFO empty and the start of a new RSSI phase for next packet. Must match the transmitter's PA ramp-down time.
+RF_PACKET2_RXRESTARTDELAY_1BIT     = 0x00  # Default
+RF_PACKET2_RXRESTARTDELAY_2BITS    = 0x10
+RF_PACKET2_RXRESTARTDELAY_4BITS    = 0x20
+RF_PACKET2_RXRESTARTDELAY_8BITS    = 0x30
+RF_PACKET2_RXRESTARTDELAY_16BITS   = 0x40
+RF_PACKET2_RXRESTARTDELAY_32BITS   = 0x50
+RF_PACKET2_RXRESTARTDELAY_64BITS   = 0x60
+RF_PACKET2_RXRESTARTDELAY_128BITS  = 0x70
+RF_PACKET2_RXRESTARTDELAY_256BITS  = 0x80
+RF_PACKET2_RXRESTARTDELAY_512BITS  = 0x90
 RF_PACKET2_RXRESTARTDELAY_1024BITS = 0xA0
 RF_PACKET2_RXRESTARTDELAY_2048BITS = 0xB0
-RF_PACKET2_RXRESTARTDELAY_NONE = 0xC0
-RF_PACKET2_RXRESTART = 0x04
+RF_PACKET2_RXRESTARTDELAY_NONE     = 0xC0
 
-RF_PACKET2_AUTORXRESTART_ON = 0x02  # Default
-RF_PACKET2_AUTORXRESTART_OFF = 0x00
+RF_PACKET2_RXRESTART = 0x04  # Forces the Receiver in WAIT mode, in Continuous Rx mode. Always reads 0.
 
-RF_PACKET2_AES_ON = 0x01
+# Enables automatic Rx restart (RSSI phase) after PayloadReady occurred and packet has been completely read from FIFO
+RF_PACKET2_AUTORXRESTART_ON = 0x02  # Default: Rx automatically restarted after InterPacketRxDelay
+RF_PACKET2_AUTORXRESTART_OFF = 0x00  # RestartRx can be used.
+
+# Enable the AES encryption/decryption
+RF_PACKET2_AES_ON  = 0x01
 RF_PACKET2_AES_OFF = 0x00  # Default
 
 
-# RegAesKey1-16
-RF_AESKEY1_VALUE = 0x00  # Default
-RF_AESKEY2_VALUE = 0x00  # Default
-RF_AESKEY3_VALUE = 0x00  # Default
-RF_AESKEY4_VALUE = 0x00  # Default
-RF_AESKEY5_VALUE = 0x00  # Default
-RF_AESKEY6_VALUE = 0x00  # Default
-RF_AESKEY7_VALUE = 0x00  # Default
-RF_AESKEY8_VALUE = 0x00  # Default
-RF_AESKEY9_VALUE = 0x00  # Default
+# RegAesKey[1-16] (0x3E-0x4D) - Bytes of cipher key
+RF_AESKEY1_VALUE  = 0x00  # Default
+RF_AESKEY2_VALUE  = 0x00  # Default
+RF_AESKEY3_VALUE  = 0x00  # Default
+RF_AESKEY4_VALUE  = 0x00  # Default
+RF_AESKEY5_VALUE  = 0x00  # Default
+RF_AESKEY6_VALUE  = 0x00  # Default
+RF_AESKEY7_VALUE  = 0x00  # Default
+RF_AESKEY8_VALUE  = 0x00  # Default
+RF_AESKEY9_VALUE  = 0x00  # Default
 RF_AESKEY10_VALUE = 0x00  # Default
 RF_AESKEY11_VALUE = 0x00  # Default
 RF_AESKEY12_VALUE = 0x00  # Default
@@ -1580,35 +1661,37 @@ RF_AESKEY15_VALUE = 0x00  # Default
 RF_AESKEY16_VALUE = 0x00  # Default
 
 
-# RegTemp1
-RF_TEMP1_MEAS_START = 0x08
-RF_TEMP1_MEAS_RUNNING = 0x04
-RF_TEMP1_ADCLOWPOWER_ON = 0x01  # Default
+# RegTemp1 (0x4E)
+RF_TEMP1_MEAS_START      = 0x08  # Triggers the temperature measurement when set. Always reads 0.
+RF_TEMP1_MEAS_RUNNING    = 0x04  # Set to 1 while the temperature measurement is running. Toggles back to 0 when the measurement has completed. The received cannot be used while measuring temperature.
+RF_TEMP1_ADCLOWPOWER_ON  = 0x01  # Default
 RF_TEMP1_ADCLOWPOWER_OFF = 0x00
 
-# RegTestDagc 0x6F: demodulator config and IO mode config
-RF_DAGC_NORMAL = 0x00  # Reset value
-RF_DAGC_IMPROVED_LOWBETA1 = 0x20  #
-RF_DAGC_IMPROVED_LOWBETA0 = 0x30  # Recommended default
+# RegTestDagc (0x6F) - Fading Margin Improvement
+RF_DAGC_NORMAL            = 0x00  # Normal mode
+RF_DAGC_IMPROVED_LOWBETA1 = 0x20  # Improved margin, use if AfcLowBetaOn = 1.
+RF_DAGC_IMPROVED_LOWBETA0 = 0x30  # Default: Improved margin, use if AfcLowBetaOn = 0.
 
-#settings pulled from RFM69.h
-RF69_315MHZ = 31  # non trivial values to avoid misconfiguration
+# Settings pulled from RFM69.h
+RF69_315MHZ = 31  # Non trivial values to avoid misconfiguration.
 RF69_433MHZ = 43
 RF69_868MHZ = 86
 RF69_915MHZ = 91
 
-RF69_MAX_DATA_LEN = 60 # to take advantage of the built in AES/CRC we want to limit the frame size to the internal FIFO size (66 bytes - 4 bytes overhead)
+RF69_MAX_DATA_LEN = 60  # To take advantage of the built in AES/CRC we want to limit the frame size to the internal FIFO size (66 bytes - 4 bytes overhead).
 
-CSMA_LIMIT = -90 # upper RX signal sensitivity threshold in dBm for carrier sense access
-RF69_MODE_SLEEP = 0 # XTAL OFF
-RF69_MODE_STANDBY = 1 # XTAL ON
-RF69_MODE_SYNTH	= 2 # PLL ON
-RF69_MODE_RX = 3 # RX MODE
-RF69_MODE_TX	= 4 # TX MODE
+CSMA_LIMIT        = -90  # Upper RX signal sensitivity threshold in dBm for carrier sense access.
+RF69_MODE_SLEEP   = 0  # XTAL OFF
+RF69_MODE_STANDBY = 1  # XTAL ON
+RF69_MODE_SYNTH   = 2  # PLL ON
+RF69_MODE_RX      = 3  # RX MODE
+RF69_MODE_TX	  = 4  # TX MODE
 
-COURSE_TEMP_COEF = -90 # puts the temperature reading in the ballpark, user can fine tune the returned value
+COURSE_TEMP_COEF    = -90  # Puts the temperature reading in the ballpark, user can fine tune the returned value.
 RF69_BROADCAST_ADDR = 255
-RF69_CSMA_LIMIT_MS = 1000
-RF69_CSMA_LIMIT_S = 1
+RF69_CSMA_LIMIT_S   = 1
+RF69_TX_LIMIT_S     = 1
+RFM69_CTL_SENDACK   = 0x80
+RFM69_CTL_REQACK    = 0x40
 
 powerLevel = 31
