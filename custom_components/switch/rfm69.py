@@ -63,7 +63,6 @@ class MultiChannelRelay(SwitchDevice):
         self._state = None
         self._available = True
         self._rfm69.add_device(node_id)
-        self._cache = True
 
     @property
     def name(self):
@@ -82,37 +81,34 @@ class MultiChannelRelay(SwitchDevice):
 
     def turn_on(self, **kwargs):
         """Turn the switch on."""
-        status = self._rfm69.send_message(self._node_id, "S.%d.1.%d." % (self._relay_pin, self._timeout))
+        status = self._rfm69.send_message(self._node_id, "S.%d.1.%d." % (self._relay_pin, self._timeout), message_to_cache="G.")
         if status is None:
-            _LOGGER.warning("Could not turn %s on", self._name)
+            _LOGGER.warning("MultiChannelRelay.turn_on(): Could not turn %s on.", self._name)
             self._available = False
             return
 
         self._state = chr(status[self._relay_pin]) == '1'
-        self._cache = False
+        self._available = True
 
     def turn_off(self, **kwargs):
         """Turn the switch off."""
-        status = self._rfm69.send_message(self._node_id, "S.%d.0." % (self._relay_pin))
+        status = self._rfm69.send_message(self._node_id, "S.%d.0." % (self._relay_pin), message_to_cache="G.")
         if status is None:
-            _LOGGER.warning("Could not turn %s off", self._name)
+            _LOGGER.warning("MultiChannelRelay.turn_off(): Could not turn %s off.", self._name)
             self._available = False
             return
 
         self._state = chr(status[self._relay_pin]) == '1'
-        self._cache = False
+        self._available = True
 
     def update(self):
         """Fetch new state data for the switch."""
-        status = self._rfm69.send_message(self._node_id, "G.", cache=self._cache)
+        status = self._rfm69.send_message(self._node_id, "G.", cache=True, message_to_cache="G.")
         if status is None:
-            _LOGGER.warning("Could not read state for %s", self._name)
+            _LOGGER.warning("MultiChannelRelay.update(): Could not read state for %s.", self._name)
             self._available = False
             return
-        self._cache = True
 
-        # _LOGGER.warning("%d %s" % (self._relay_pin, status))
-        _LOGGER.warning(status)
         self._state = chr(status[self._relay_pin]) == '1'
         self._available = True
 
