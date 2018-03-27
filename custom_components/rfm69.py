@@ -221,11 +221,11 @@ class RFM69(object):
           #no shaping
           0x02: [REG_DATAMODUL, RF_DATAMODUL_DATAMODE_PACKET | RF_DATAMODUL_MODULATIONTYPE_FSK | RF_DATAMODUL_MODULATIONSHAPING_00],
           #default:4.8 KBPS
-          0x03: [REG_BITRATEMSB, RF_BITRATEMSB_55555],
-          0x04: [REG_BITRATELSB, RF_BITRATELSB_55555],
+          0x03: [REG_BITRATEMSB, RF_BITRATEMSB_4800], # Default: 55555
+          0x04: [REG_BITRATELSB, RF_BITRATELSB_4800],
           #default:5khz, (FDEV + BitRate/2 <= 500Khz)
-          0x05: [REG_FDEVMSB, RF_FDEVMSB_50000],
-          0x06: [REG_FDEVLSB, RF_FDEVLSB_50000],
+          0x05: [REG_FDEVMSB, RF_FDEVMSB_5000], # Default: 50000
+          0x06: [REG_FDEVLSB, RF_FDEVLSB_5000],
 
           0x07: [REG_FRFMSB, frfMSB[freqBand]],
           0x08: [REG_FRFMID, frfMID[freqBand]],
