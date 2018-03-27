@@ -123,7 +123,7 @@ class Rfm69hcw(object):
 
     def __init__(self, network_id, node_id, aes_encrypt_key=None):
         self._rfm69 = RFM69(RF69_915MHZ, node_id, network_id, intPin=15, rstPin=13, interrupt_callback=self._receive)
-        self._rfm69.setPowerLevel(pa_level=1)
+        self._rfm69.setPowerLevel(pa_level=1, power=RF_PALEVEL_OUTPUTPOWER_10000)
 
         if aes_encrypt_key is not None:
             # Encryption key must be 16 bytes
@@ -158,7 +158,7 @@ class Rfm69hcw(object):
         if response is None:
             _LOGGER.warning("Rfm69hcw.receive_message(): Unable to receive message from node %d" % id_sender)
         elif message_to_cache is not None:
-            _LOGGER.warning("receive_message(): caching {0} in {1}".format(response, message_to_cache))
+            # _LOGGER.warning("receive_message(): caching {0} in {1}".format(response, message_to_cache))
             self._cache[message_to_cache] = (response, time.time())
 
         return response
@@ -166,7 +166,7 @@ class Rfm69hcw(object):
     def send_message(self, id_target, message, time_wait_sec=1.0, num_retries=3, cache=False, message_to_cache=None):
         # Fetch from cache
         if cache and message in self._cache and time.time() - self._cache[message][1] < self.CACHE_EXPIRE_SEC:
-            _LOGGER.warning("send_message(): cache {0} from {1}".format(self._cache[message], message))
+            # _LOGGER.warning("send_message(): cache {0} from {1}".format(self._cache[message], message))
             return self._cache[message][0]
 
         try:
@@ -176,7 +176,7 @@ class Rfm69hcw(object):
                 reply = self.receive_message(id_target, time_wait_sec, message_to_cache)
 
                 if reply is not None:
-                    _LOGGER.warning("send_message(): received {0}".format(message))
+                    # _LOGGER.warning("send_message(): received {0}".format(message))
                     return reply
         except RuntimeError as err:
             _LOGGER.warning(err)
@@ -237,7 +237,7 @@ class RFM69(object):
           # +13dBm formula: Pout=-18+OutputPower (with PA0 or PA1**)
           # +17dBm formula: Pout=-14+OutputPower (with PA1 and PA2)**
           # +20dBm formula: Pout=-11+OutputPower (with PA1 and PA2)** and high power PA settings (section 3.3.7 in datasheet)
-          # 0x11: [REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | RF_PALEVEL_OUTPUTPOWER_11111],
+          0x11: [REG_PALEVEL, RF_PALEVEL_PA0_ON | RF_PALEVEL_PA1_OFF | RF_PALEVEL_PA2_OFF | RF_PALEVEL_OUTPUTPOWER_11111],
           # Over current protection (default is 95mA)
           # 0x13: [REG_OCP, RF_OCP_ON | RF_OCP_TRIM_95],
 
@@ -391,7 +391,7 @@ class RFM69(object):
 
         # Wait for data transfer
         self.sema_data_sent.acquire()
-        _LOGGER.warning("sendFrame(): Sent {0}.".format(data))
+        # _LOGGER.warning("sendFrame(): Sent {0}.".format(data))
         self.setMode(RF69_MODE_RX)
 
     def _receive(self):
@@ -410,7 +410,7 @@ class RFM69(object):
 
     def interruptHandler(self, pin):
         # TODO: Use threading locks?
-        _LOGGER.warning("Interrupt on pin %d in mode %d" % (pin, self.mode))
+        # _LOGGER.warning("Interrupt on pin %d in mode %d" % (pin, self.mode))
         with self.lock:
             if self.mode == RF69_MODE_TX:
                 self.sema_data_sent.release()
@@ -471,7 +471,7 @@ class RFM69(object):
     def promiscuous(self, onOff):
         self.promiscuousMode = onOff
 
-    def setPowerLevel(self, pa_level=0, power=RF_PALEVEL_OUTPUTPOWER_11111):
+    def setPowerLevel(self, pa_level=0, power=0x1F):
         """
         Args:
             power: [0, 31]
