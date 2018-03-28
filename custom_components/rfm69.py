@@ -143,10 +143,10 @@ class Rfm69hcw(object):
 
     def _receive(self, data, ack_received, id_sender, rssi):
         if id_sender in self._responses:
-            _LOGGER.warning("Rfm69hcw._receive(): Received message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
+            # _LOGGER.warning("Rfm69hcw._receive(): Received message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
             self._responses[id_sender].put(data)
-        else:
-            _LOGGER.warning("Rfm69hcw._receive(): Discarded message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
+        # else:
+        #     _LOGGER.warning("Rfm69hcw._receive(): Discarded message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
 
     def receive_message(self, id_sender, time_wait_sec=1.0, message_to_cache=None):
         """
@@ -171,7 +171,7 @@ class Rfm69hcw(object):
 
         try:
             for i in range(num_retries):
-                _LOGGER.warning("send_message(): Sending {0} {1} out of {2}.".format(message, i+1, num_retries))
+                # _LOGGER.warning("send_message(): Sending {0} {1} out of {2}.".format(message, i+1, num_retries))
                 self._rfm69.send(id_target, message)
                 reply = self.receive_message(id_target, time_wait_sec, message_to_cache)
 

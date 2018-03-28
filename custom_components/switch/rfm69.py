@@ -60,6 +60,7 @@ class MultiChannelRelay(SwitchDevice):
         self._node_id = node_id
         self._relay_pin = relay_pin
         self._timeout = timeout_ms
+        self._cache = True
         self._state = None
         self._available = True
         self._rfm69.add_device(node_id)
@@ -89,6 +90,7 @@ class MultiChannelRelay(SwitchDevice):
 
         self._state = chr(status[self._relay_pin]) == '1'
         self._available = True
+        self._cache = False
 
     def turn_off(self, **kwargs):
         """Turn the switch off."""
@@ -100,10 +102,11 @@ class MultiChannelRelay(SwitchDevice):
 
         self._state = chr(status[self._relay_pin]) == '1'
         self._available = True
+        self._cache = False
 
     def update(self):
         """Fetch new state data for the switch."""
-        status = self._rfm69.send_message(self._node_id, "G.", cache=True, message_to_cache="G.")
+        status = self._rfm69.send_message(self._node_id, "G.", cache=self._cache, message_to_cache="G.")
         if status is None:
             _LOGGER.warning("MultiChannelRelay.update(): Could not read state for %s.", self._name)
             self._available = False
@@ -111,4 +114,5 @@ class MultiChannelRelay(SwitchDevice):
 
         self._state = chr(status[self._relay_pin]) == '1'
         self._available = True
+        self._cache = True
 
