@@ -36,7 +36,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
     # Verify that Rfm69 chip is present
     if rfm69.RADIO is None:
         _LOGGER.error("A connection has not been made to the Rfm69 chip")
-        return False
+        return
 
     node_id = config[CONF_NODE_ID]
     switches = config[CONF_SWITCHES]

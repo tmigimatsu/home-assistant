@@ -89,7 +89,7 @@ class ExpireQueue:
 
         Args:
             block          (Bool)  - If True, wait for message. If False, return immediately.
-            timeout        (float) - Seconds to block on message.
+            timeout        (float) - Seconds to block on message. If None, wait indefinitely.
 
         Returns:
             (item, t_wait) - Seconds item was left in the queue.
@@ -118,7 +118,6 @@ class ExpireQueue:
 class Rfm69hcw(object):
     """Representation of an RFM69HCW chip."""
 
-    MESSAGE_EXPIRE_SEC = 5
     CACHE_EXPIRE_SEC = 20
 
     def __init__(self, network_id, node_id, aes_encrypt_key=None):
@@ -138,15 +137,17 @@ class Rfm69hcw(object):
 
         self._rfm69.startListening()
 
-    def add_device(self, node_id):
-        self._responses[node_id] = ExpireQueue(self.MESSAGE_EXPIRE_SEC)
+    def add_device(self, node_id, message_expire_sec=5):
+        if node_id not in self._responses:
+            _LOGGER.warning("Rfm69hcw.add_device(): Adding node {0}.".format(node_id))
+            self._responses[node_id] = ExpireQueue(message_expire_sec)
 
     def _receive(self, data, ack_received, id_sender, rssi):
         if id_sender in self._responses:
             # _LOGGER.warning("Rfm69hcw._receive(): Received message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
             self._responses[id_sender].put(data)
-        # else:
-        #     _LOGGER.warning("Rfm69hcw._receive(): Discarded message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
+        else:
+            _LOGGER.warning("Rfm69hcw._receive(): Discarded message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
 
     def receive_message(self, id_sender, time_wait_sec=1.0, message_to_cache=None):
         """
@@ -154,9 +155,10 @@ class Rfm69hcw(object):
             node_id
             time_wait_sec - if None, wait indefinitely
         """
-        response = self._responses[id_sender].get(True, time_wait_sec)
+        response = self._responses[id_sender].get(block=True, timeout=time_wait_sec)
         if response is None:
-            _LOGGER.warning("Rfm69hcw.receive_message(): Unable to receive message from node %d" % id_sender)
+            pass
+            # _LOGGER.warning("Rfm69hcw.receive_message(): Unable to receive message from node %d" % id_sender)
         elif message_to_cache is not None:
             # _LOGGER.warning("receive_message(): caching {0} in {1}".format(response, message_to_cache))
             self._cache[message_to_cache] = (response, time.time())
@@ -181,7 +183,7 @@ class Rfm69hcw(object):
         except RuntimeError as err:
             _LOGGER.warning(err)
 
-        _LOGGER.warning("Rfm69hcw.send_message(): Unable to send message \"%s\" to node %d" % (message, id_target))
+        # _LOGGER.warning("Rfm69hcw.send_message(): Unable to send message \"%s\" to node %d" % (message, id_target))
         return None
 
     def shutdown(self):
