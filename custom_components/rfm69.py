@@ -62,6 +62,56 @@ def setup(hass, config):
     return True
 
 
+class ExpireCache:
+
+    def __init__(self, msg_timeout_sec=10.0, time_wait_sec=1.0):
+        self._msg_timeout = msg_timeout_sec  # Message timeout
+        self._time_wait   = time_wait_sec    # Get timeout
+        self._cache       = {}               # Message cache
+        self._cv_waiting  = threading.Condition()
+
+    def clear(self, key):
+        with self._cv_waiting:
+            self._cache[key] = None
+
+    def __setitem__(self, key, item):
+        """
+        Push item to cache.
+        """
+        with self._cv_waiting:
+            t_curr = time.time()
+            self._cache[key] = (item, t_curr)
+            self._cv_waiting.notify()
+
+    def _get(self, key):
+        """Assumes self._cv_waiting is acquired."""
+        if key in self._cache:
+            item = self._cache[key]
+            if item is not None and time.time() - item[1] < self._msg_timeout:
+                return item[0]
+        return None
+
+    def __getitem__(self, key):
+        """
+        Pop item from cache.
+
+        Args:
+            block          (Bool)  - If True, wait for message. If False, return immediately.
+            timeout        (float) - Seconds to block on message. If None, wait indefinitely.
+
+        Returns:
+            (item, t_wait) - Seconds item was left in the queue.
+        """
+        with self._cv_waiting:
+            item = self._get(key)
+            if item is not None:
+                return item
+
+            # Wait until timeout or signal
+            self._cv_waiting.wait(self._time_wait)
+            return self._get(key)
+
+
 class ExpireQueue:
 
     def __init__(self, timeout=10):
@@ -94,8 +144,6 @@ class ExpireQueue:
         Returns:
             (item, t_wait) - Seconds item was left in the queue.
         """
-        t_start = time.time()
-
         with self._cv_waiting:
             t_curr = time.time()
             self._flush(t_curr)
@@ -137,53 +185,59 @@ class Rfm69hcw(object):
 
         self._rfm69.startListening()
 
-    def add_device(self, node_id, message_expire_sec=5):
+    def add_device(self, node_id, msg_timeout_sec=10.0, time_wait_sec=1.0):
+        """
+        Add new device to track.
+
+        Args:
+            node_id         - device node id
+            msg_timeout_sec - cache message timeout
+            time_wait_sec   - receive message wait time
+        """
         if node_id not in self._responses:
             _LOGGER.warning("Rfm69hcw.add_device(): Adding node {0}.".format(node_id))
-            self._responses[node_id] = ExpireQueue(message_expire_sec)
+            self._responses[node_id] = ExpireCache(msg_timeout_sec, time_wait_sec)
 
     def _receive(self, data, ack_received, id_sender, rssi):
+        """
+        Receive message and store inside cache.
+        """
         if id_sender in self._responses:
-            # _LOGGER.warning("Rfm69hcw._receive(): Received message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
-            self._responses[id_sender].put(data)
+            _LOGGER.warning("Rfm69hcw._receive(): Received message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
+            self._responses[id_sender]["status"] = data
         else:
             _LOGGER.warning("Rfm69hcw._receive(): Discarded message {0} from node {1} with RSSI {2}.".format(data, id_sender, rssi))
 
-    def receive_message(self, id_sender, time_wait_sec=1.0, message_to_cache=None):
+    def receive_message(self, id_sender):
+        """
+        Get message from cache.
+        """
+        return self._responses[id_sender]["status"]
+
+    def send_message(self, id_target, message, num_retries=3, cache=False):
         """
         Args:
-            node_id
-            time_wait_sec - if None, wait indefinitely
+            id_target   - target node id
+            message     - message
+            num_retries - number of retries
+            cache       - if False, flush cache and wait for new response
         """
-        response = self._responses[id_sender].get(block=True, timeout=time_wait_sec)
-        if response is None:
-            pass
-            # _LOGGER.warning("Rfm69hcw.receive_message(): Unable to receive message from node %d" % id_sender)
-        elif message_to_cache is not None:
-            # _LOGGER.warning("receive_message(): caching {0} in {1}".format(response, message_to_cache))
-            self._cache[message_to_cache] = (response, time.time())
+        if cache:
+            reply = self._responses[id_target]["status"]
+            if reply is not None:
+                return reply
+        else:
+            self._responses[id_target].clear("status")
 
-        return response
+        for i in range(num_retries):
+            _LOGGER.warning("Rfm69hcw.send_message(): Sending '{0}' {1} out of {2}.".format(message, i+1, num_retries))
+            self._rfm69.send(id_target, message)
+            reply = self.receive_message(id_target)
 
-    def send_message(self, id_target, message, time_wait_sec=1.0, num_retries=3, cache=False, message_to_cache=None):
-        # Fetch from cache
-        if cache and message in self._cache and time.time() - self._cache[message][1] < self.CACHE_EXPIRE_SEC:
-            # _LOGGER.warning("send_message(): cache {0} from {1}".format(self._cache[message], message))
-            return self._cache[message][0]
+            if reply is not None:
+                return reply
 
-        try:
-            for i in range(num_retries):
-                # _LOGGER.warning("send_message(): Sending {0} {1} out of {2}.".format(message, i+1, num_retries))
-                self._rfm69.send(id_target, message)
-                reply = self.receive_message(id_target, time_wait_sec, message_to_cache)
-
-                if reply is not None:
-                    # _LOGGER.warning("send_message(): received {0}".format(message))
-                    return reply
-        except RuntimeError as err:
-            _LOGGER.warning(err)
-
-        # _LOGGER.warning("Rfm69hcw.send_message(): Unable to send message \"%s\" to node %d" % (message, id_target))
+        _LOGGER.warning("Rfm69hcw.send_message(): Unable to send message '{0}' to node {1}".format(message, id_target))
         return None
 
     def shutdown(self):
@@ -195,7 +249,6 @@ class RFM69(object):
     def __init__(self, freqBand, nodeID, networkID, intPin=18, rstPin=28, spiBus=0, spiDevice=0, interrupt_callback=None):
         import spidev
         import RPi.GPIO as GPIO
-        from queue import Queue
 
         self.freqBand = freqBand
         self.address = nodeID
@@ -209,9 +262,9 @@ class RFM69(object):
         self.lock = threading.RLock()
         self.mode = ""
         self.promiscuousMode = False
-        self.queue_data = Queue()
-        self.sema_data_received = threading.Semaphore()
-        self.sema_data_sent = threading.Semaphore()
+        self.queue_data = collections.deque()
+        self.sema_data_received = threading.Semaphore(0)
+        self.sema_data_sent = threading.Semaphore(0)
         self.callback = interrupt_callback
 
         GPIO.cleanup()
@@ -400,7 +453,8 @@ class RFM69(object):
         try:
             self.receiveBegin()
             while self.sema_data_received.acquire():
-                data, byte_ctl, id_sender, rssi = self.queue_data.get()
+                _LOGGER.warning("_receive: {0}".format(len(self.queue_data)))
+                data, byte_ctl, id_sender, rssi = self.queue_data.popleft()
                 ack_received  = byte_ctl & RFM69_CTL_SENDACK
                 ack_requested = byte_ctl & RFM69_CTL_REQACK
                 if ack_requested:
@@ -408,7 +462,7 @@ class RFM69(object):
                 if data or ack_received:
                     self.callback(data, ack_received, id_sender, rssi)
         except Exception as e:
-            _LOGGER.error("_receive() ERROR: {0}".format(e))
+            _LOGGER.error("_receive(): {0}".format(e))
 
     def interruptHandler(self, pin):
         # TODO: Use threading locks?
@@ -434,7 +488,7 @@ class RFM69(object):
                 self.setMode(RF69_MODE_RX)
                 rssi = self.readRSSI()
 
-                self.queue_data.put((data, byte_ctl, id_sender, rssi))
+                self.queue_data.append((data, byte_ctl, id_sender, rssi))
                 self.sema_data_received.release()
 
     def receiveBegin(self):
